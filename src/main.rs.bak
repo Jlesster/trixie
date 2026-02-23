@@ -1,6 +1,3 @@
-mod config;
-use config::{Config, KeyAction};
-
 use std::{
     collections::HashMap,
     os::unix::io::{FromRawFd, IntoRawFd},
@@ -61,7 +58,7 @@ use smithay::{
         wayland_server::{
             backend::{ClientData, ClientId, DisconnectReason},
             protocol::{wl_buffer::WlBuffer, wl_output, wl_seat, wl_surface::WlSurface},
-            Client, Display as WlDisplay, DisplayHandle, Resource,
+            Client, Display, DisplayHandle, Resource,
         },
     },
     utils::{
@@ -99,10 +96,9 @@ use smithay::{
     },
 };
 
-use xkbcommon::xkb;
-
 // ── type alias ────────────────────────────────────────────────────────────────
 
+/// Convenience alias matching the pattern used in smithay's own anvil example.
 pub type GbmDrmCompositor =
     DrmCompositor<GbmAllocator<DrmDeviceFd>, GbmFramebufferExporter<DrmDeviceFd>, (), DrmDeviceFd>;
 
@@ -142,8 +138,6 @@ struct KittyCompositor {
     running: Arc<AtomicBool>,
     handle: LoopHandle<'static, Self>,
     clock: Clock<Monotonic>,
-    config: Config,
-    libinput: Libinput,
 
     compositor_state: CompositorState,
     shm_state: ShmState,
@@ -166,7 +160,6 @@ struct KittyCompositor {
     session: LibSeatSession,
     backends: HashMap<DrmNode, BackendData>,
     primary_gpu: DrmNode,
-    wayland_socket: String,
 }
 
 // ── DmabufHandler ─────────────────────────────────────────────────────────────
@@ -312,22 +305,8 @@ impl XdgShellHandler for KittyCompositor {
         self.space.map_element(window, (0, 0), true);
     }
     fn toplevel_destroyed(&mut self, _: ToplevelSurface) {
-        // Only quit if there are no windows left AND the primary terminal is gone.
-        // We relaunch the terminal if it closes so trixie always has a window.
         if self.space.elements().count() == 0 {
-            let (bin, args) = self.config.terminal_cmd();
-            tracing::info!("Terminal closed — relaunching {bin}");
-            match Command::new(&bin)
-                .args(&args)
-                .env("WAYLAND_DISPLAY", &self.wayland_socket)
-                .spawn()
-            {
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::error!("Failed to relaunch {bin}: {e} — quitting");
-                    self.running.store(false, Ordering::SeqCst);
-                }
-            }
+            self.running.store(false, Ordering::SeqCst);
         }
     }
     fn new_popup(&mut self, surface: PopupSurface, _: PositionerState) {
@@ -412,38 +391,13 @@ fn surface_under(
     })
 }
 
-fn vt_from_keysym(keysym: xkb::Keysym) -> Option<u32> {
-    const VT_FIRST: u32 = 0x1008FE01;
-    const VT_LAST: u32 = 0x1008FE0C;
-    let raw = keysym.raw();
-    if raw >= VT_FIRST && raw <= VT_LAST {
-        Some(raw - VT_FIRST + 1)
-    } else {
-        None
-    }
-}
-
-/// Spawn a command from a `KeyAction::Spawn`, passing the Wayland socket.
-fn spawn_action(cmd: &str, args: &[String], wayland_socket: &str) {
-    let bin = config::expand_tilde(cmd);
-    if let Err(e) = Command::new(&bin)
-        .args(args)
-        .env("WAYLAND_DISPLAY", wayland_socket)
-        .spawn()
-    {
-        tracing::warn!("Spawn failed ({bin}): {e}");
-    }
-}
-
 // ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
     tracing_subscriber::fmt().compact().init();
 
-    let config = Config::load();
-
     let mut event_loop: EventLoop<'static, KittyCompositor> = EventLoop::try_new().unwrap();
-    let display: WlDisplay<KittyCompositor> = WlDisplay::new().unwrap();
+    let display: Display<KittyCompositor> = Display::new().unwrap();
     let dh = display.handle();
 
     event_loop
@@ -451,7 +405,6 @@ fn main() {
         .insert_source(
             Generic::new(display, Interest::READ, CalloopMode::Level),
             |_, display, state| {
-                // SAFETY: we are the only user of this display
                 unsafe {
                     display.get_mut().dispatch_clients(state).unwrap();
                 }
@@ -480,21 +433,12 @@ fn main() {
         .insert_source(notifier, |event, _, state| match event {
             SessionEvent::PauseSession => {
                 tracing::info!("Session paused");
-                state.libinput.suspend();
                 for backend in state.backends.values_mut() {
                     backend.drm.pause();
                 }
             }
             SessionEvent::ActivateSession => {
                 tracing::info!("Session resumed");
-                // Reassign the seat to wake libinput back up. This re-opens
-                // all device fds that were closed during suspend.
-                if let Err(e) = state
-                    .libinput
-                    .udev_assign_seat(state.session.seat().as_str())
-                {
-                    tracing::error!("Failed to reassign libinput seat on resume: {:?}", e);
-                }
                 for backend in state.backends.values_mut() {
                     if let Err(e) = backend.drm.activate(false) {
                         tracing::error!("Failed to activate DRM: {e}");
@@ -519,30 +463,11 @@ fn main() {
         });
     tracing::info!("Primary GPU: {primary_gpu}");
 
-    // ── libinput (constructed early so we can store it in state) ─────────────
-    let mut libinput_ctx =
-        Libinput::new_with_udev::<LibinputSessionInterface<LibSeatSession>>(session.clone().into());
-    libinput_ctx
-        .udev_assign_seat(session.seat().as_str())
-        .unwrap();
-
-    // ── seat + keyboard ───────────────────────────────────────────────────────
+    // ── initial state ─────────────────────────────────────────────────────────
     let mut seat_state = SeatState::new();
-    let mut seat = seat_state.new_wl_seat(&dh, &config.seat_name);
+    let mut seat = seat_state.new_wl_seat(&dh, "seat0");
     let pointer = seat.add_pointer();
-
-    let xkb_config = XkbConfig {
-        layout: config.keyboard.layout.as_deref().unwrap_or(""),
-        variant: config.keyboard.variant.as_deref().unwrap_or(""),
-        options: config.keyboard.options.clone(),
-        ..XkbConfig::default()
-    };
-    seat.add_keyboard(
-        xkb_config,
-        config.keyboard.repeat_delay as i32,
-        config.keyboard.repeat_rate as i32,
-    )
-    .unwrap();
+    seat.add_keyboard(XkbConfig::default(), 200, 25).unwrap();
 
     let dmabuf_state = DmabufState::new();
 
@@ -551,7 +476,6 @@ fn main() {
         running: Arc::new(AtomicBool::new(true)),
         handle: event_loop.handle(),
         clock: Clock::new(),
-        config,
         compositor_state: CompositorState::new::<KittyCompositor>(&dh),
         shm_state: ShmState::new::<KittyCompositor>(&dh, vec![]),
         dmabuf_state,
@@ -575,8 +499,6 @@ fn main() {
         session,
         backends: HashMap::new(),
         primary_gpu,
-        wayland_socket: socket_name.clone(),
-        libinput: libinput_ctx,
     };
 
     // ── udev ──────────────────────────────────────────────────────────────────
@@ -591,7 +513,9 @@ fn main() {
         }
     }
 
+    // dmabuf global from primary GPU formats
     if let Some(backend) = state.backends.get(&state.primary_gpu) {
+        // FormatSet is not an iterator directly — use .iter()
         let formats: Vec<_> = backend.renderer.dmabuf_formats().iter().copied().collect();
         let global = state
             .dmabuf_state
@@ -608,7 +532,10 @@ fn main() {
                 }
             }
             UdevEvent::Changed { device_id } => {
-                if let Ok(_node) = DrmNode::from_dev_id(device_id) {}
+                if let Ok(_node) = DrmNode::from_dev_id(device_id) {
+                    // DrmDevice has no explicit changed() method in smithay 0.7;
+                    // hotplug changes are handled automatically via DRM events.
+                }
             }
             UdevEvent::Removed { device_id } => {
                 if let Ok(node) = DrmNode::from_dev_id(device_id) {
@@ -619,7 +546,13 @@ fn main() {
         .unwrap();
 
     // ── libinput ──────────────────────────────────────────────────────────────
-    let libinput_backend = LibinputInputBackend::new(state.libinput.clone());
+    let mut libinput_ctx = Libinput::new_with_udev::<LibinputSessionInterface<LibSeatSession>>(
+        state.session.clone().into(),
+    );
+    libinput_ctx
+        .udev_assign_seat(state.session.seat().as_str())
+        .unwrap();
+    let libinput_backend = LibinputInputBackend::new(libinput_ctx.clone());
 
     event_loop
         .handle()
@@ -630,18 +563,12 @@ fn main() {
 
     state.handle.insert_idle(|state| state.render_all());
 
-    // ── launch terminal ───────────────────────────────────────────────────────
-    // Use terminal_cmd() so that shell-style quoting, inline arguments, and
-    // tilde expansion in the config value are all handled correctly.
-    // e.g. `terminal = "kitty -c ~/.config/trixie/kitty/kitty.conf"` works.
     let running = state.running.clone();
-    let (bin, args) = state.config.terminal_cmd();
-    println!("Launching {bin} on WAYLAND_DISPLAY={socket_name}");
-    Command::new(&bin)
-        .args(&args)
+    println!("Launching kitty on WAYLAND_DISPLAY={socket_name}");
+    Command::new("kitty")
         .env("WAYLAND_DISPLAY", &socket_name)
         .spawn()
-        .unwrap_or_else(|e| panic!("Failed to spawn {bin}: {e}"));
+        .expect("Failed to spawn kitty — is it installed?");
 
     while running.load(Ordering::SeqCst) {
         let _ = event_loop.dispatch(Some(Duration::from_millis(4)), &mut state);
@@ -664,6 +591,7 @@ fn add_gpu(
         path,
         rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOCTTY,
     )?;
+    // Use raw fd to sidestep OwnedFd crate-version mismatch between rustix and smithay
     let raw_fd = owned_fd.into_raw_fd();
     let drm_fd = DrmDeviceFd::new(unsafe { DeviceFd::from_raw_fd(raw_fd) });
 
@@ -673,11 +601,14 @@ fn add_gpu(
     let ctx = EGLContext::new(&egl)?;
     let mut renderer = unsafe { GlesRenderer::new(ctx)? };
 
+    // bind_wl_display is a method on EGLDisplay via the EGLGraphicsBackend trait
     if let Err(e) = egl.bind_wl_display(dh) {
         tracing::warn!("EGL bind_wl_display failed (hw-accel unavailable): {e}");
     }
 
-    let node_copy = node;
+    let drm_node = node;
+
+    let node_copy = drm_node;
     state
         .handle
         .insert_source(drm_notifier, move |event, _, state| {
@@ -692,9 +623,10 @@ fn add_gpu(
         renderer,
         gbm,
         drm,
-        drm_node: node,
+        drm_node,
     };
 
+    // resource_handles / get_connector require DrmControlDevice in scope
     let res_handles = backend.drm.resource_handles()?;
     let connectors: Vec<_> = res_handles
         .connectors()
@@ -711,12 +643,14 @@ fn add_gpu(
             .or_else(|| connector.modes().first())
             .copied();
         let Some(mode) = mode else { continue };
+
         let crtc = res_handles
             .crtcs()
             .iter()
             .copied()
             .find(|&crtc| !backend.surfaces.contains_key(&crtc));
         let Some(crtc) = crtc else { continue };
+
         if let Err(e) = add_output(
             state,
             dh,
@@ -730,7 +664,7 @@ fn add_gpu(
         }
     }
 
-    state.backends.insert(node, backend);
+    state.backends.insert(drm_node, backend);
     Ok(())
 }
 
@@ -747,6 +681,7 @@ fn add_output(
         size: (drm_mode.size().0 as i32, drm_mode.size().1 as i32).into(),
         refresh: drm_mode.vrefresh() as i32 * 1000,
     };
+
     let output = Output::new(
         format!("{node}-{crtc:?}"),
         PhysicalProperties {
@@ -770,7 +705,11 @@ fn add_output(
         backend.gbm.clone(),
         GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
     );
+
+    // GbmFramebufferExporter satisfies ExportFramebuffer<GbmBuffer> —
+    // this is the fix for the main trait-bound error.
     let exporter = GbmFramebufferExporter::new(backend.gbm.clone(), Some(node));
+
     let color_formats = [Fourcc::Argb8888, Fourcc::Xrgb8888];
 
     let compositor = DrmCompositor::new(
@@ -785,7 +724,7 @@ fn add_output(
             .egl_context()
             .dmabuf_render_formats()
             .clone(),
-        Size::<u32, smithay::utils::Buffer>::from((64, 64)),
+        Size::<u32, smithay::utils::Buffer>::from((64, 64)), // ← missing arg
         None::<GbmDevice<DrmDeviceFd>>,
     )?;
 
@@ -828,6 +767,7 @@ impl KittyCompositor {
             .map(|m| m.size.to_logical(1))
             .unwrap_or_default();
 
+        // keep kitty filling the output
         let windows: Vec<_> = self.space.elements().cloned().collect();
         for window in &windows {
             if let Some(toplevel) = window.toplevel() {
@@ -859,12 +799,11 @@ impl KittyCompositor {
             }
         };
 
-        let bg = self.config.background_color;
         let render_res = surface_data.compositor.render_frame(
             &mut backend.renderer,
             &elements,
-            bg,
-            FrameFlags::empty(),
+            [0.05f32, 0.05, 0.05, 1.0],
+            FrameFlags::empty(), // ← missing arg
         );
 
         match render_res {
@@ -884,7 +823,6 @@ impl KittyCompositor {
             Err(e) => tracing::warn!("render_frame: {e}"),
         }
 
-        // Fallback ~60 Hz timer keeps the loop alive when frames are empty.
         let handle = self.handle.clone();
         handle
             .insert_source(
@@ -905,6 +843,7 @@ impl KittyCompositor {
                 }
             }
         }
+        // Schedule next render after vblank, not on a blind timer
         self.handle.clone().insert_idle(move |state| {
             state.render_surface(node, crtc);
         });
@@ -914,11 +853,11 @@ impl KittyCompositor {
 // ── input ─────────────────────────────────────────────────────────────────────
 
 fn handle_input(state: &mut KittyCompositor, event: InputEvent<LibinputInputBackend>) {
-    use smithay::backend::input::KeyState;
     use smithay::backend::input::{
         AbsolutePositionEvent, Axis, Event, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
         PointerMotionAbsoluteEvent,
     };
+    use smithay::input::keyboard::FilterResult;
     use smithay::reexports::wayland_server::protocol::wl_pointer;
 
     match event {
@@ -927,105 +866,23 @@ fn handle_input(state: &mut KittyCompositor, event: InputEvent<LibinputInputBack
             let time = event.time_msec();
             let keycode = event.key_code();
             let key_state = event.state();
-
             let surface = state
                 .space
                 .elements()
                 .next()
                 .and_then(|w| w.wl_surface().map(|s| s.into_owned()));
-
             let kbd = state.seat.get_keyboard().unwrap();
             if kbd.current_focus().is_none() {
                 if let Some(s) = surface {
                     kbd.set_focus(state, Some(s), serial);
                 }
             }
-
-            let keybinds = state.config.keybinds.clone();
-            let wayland_socket = state.wayland_socket.clone();
-
             let kbd = state.seat.get_keyboard().unwrap();
-            kbd.input(
-                state,
-                keycode,
-                key_state,
-                serial,
-                time,
-                |state, mods, keysym_handle| {
-                    if key_state != KeyState::Pressed {
-                        return FilterResult::Forward;
-                    }
-
-                    // ── VT switching (Ctrl+Alt+F1-F12) — checked first ────────
-                    if mods.ctrl && mods.alt {
-                        let base_sym = keysym_handle
-                            .raw_syms()
-                            .first()
-                            .copied()
-                            .unwrap_or(xkb::Keysym::NoSymbol);
-
-                        let vt = vt_from_keysym(keysym_handle.modified_sym()).or_else(|| {
-                            let raw = base_sym.raw();
-                            // XKB_KEY_F1=0xFFBE … XKB_KEY_F12=0xFFC9
-                            if raw >= 0xFFBE && raw <= 0xFFC9 {
-                                Some(raw - 0xFFBE + 1)
-                            } else {
-                                None
-                            }
-                        });
-
-                        if let Some(vt) = vt {
-                            tracing::info!("Switching to VT {vt}");
-                            if let Err(e) = state.session.change_vt(vt as i32) {
-                                tracing::warn!("VT switch to {vt} failed: {e}");
-                            }
-                            return FilterResult::Intercept(());
-                        }
-                    }
-
-                    // ── user keybinds ─────────────────────────────────────────
-                    let pressed_name = xkb::keysym_get_name(keysym_handle.modified_sym());
-                    tracing::debug!(
-                        "key pressed: sym={} mods=super:{} shift:{} ctrl:{} alt:{}",
-                        pressed_name,
-                        mods.logo,
-                        mods.shift,
-                        mods.ctrl,
-                        mods.alt,
-                    );
-                    for bind in &keybinds {
-                        if !config::mods_match(mods, &bind.mods) {
-                            continue;
-                        }
-                        let name = xkb::keysym_get_name(keysym_handle.modified_sym());
-                        if name != bind.key {
-                            continue;
-                        }
-                        match &bind.action {
-                            KeyAction::Quit => {
-                                state.running.store(false, Ordering::SeqCst);
-                            }
-                            KeyAction::CloseWindow => {
-                                if let Some(w) = state.space.elements().next().cloned() {
-                                    if let Some(t) = w.toplevel() {
-                                        t.send_close();
-                                    }
-                                }
-                            }
-                            KeyAction::Spawn { command, args } => {
-                                spawn_action(command, args, &wayland_socket);
-                            }
-                        }
-                        return FilterResult::Intercept(());
-                    }
-
-                    FilterResult::Forward
-                },
-            );
+            kbd.input::<(), _>(state, keycode, key_state, serial, time, |_, _, _| {
+                FilterResult::Forward
+            });
         }
-
         InputEvent::PointerMotionAbsolute { event } => {
-            use smithay::backend::input::PointerMotionAbsoluteEvent;
             let output_geo = state
                 .space
                 .outputs()
@@ -1047,7 +904,6 @@ fn handle_input(state: &mut KittyCompositor, event: InputEvent<LibinputInputBack
             );
             ptr.frame(state);
         }
-
         InputEvent::PointerMotion { event } => {
             use smithay::backend::input::PointerMotionEvent;
             let mut pos = state.pointer.current_location() + event.delta();
@@ -1078,9 +934,7 @@ fn handle_input(state: &mut KittyCompositor, event: InputEvent<LibinputInputBack
             );
             ptr.frame(state);
         }
-
         InputEvent::PointerButton { event } => {
-            use smithay::backend::input::PointerButtonEvent;
             let serial = SCOUNTER.next_serial();
             let button = event.button_code();
             let btn_state = wl_pointer::ButtonState::from(event.state());
@@ -1096,11 +950,8 @@ fn handle_input(state: &mut KittyCompositor, event: InputEvent<LibinputInputBack
                     state.space.raise_element(&w, true);
                 }
                 if let Some(s) = surface {
-                    state
-                        .seat
-                        .get_keyboard()
-                        .unwrap()
-                        .set_focus(state, Some(s), serial);
+                    let kbd = state.seat.get_keyboard().unwrap();
+                    kbd.set_focus(state, Some(s), serial);
                 }
             }
             let ptr = state.pointer.clone();
@@ -1115,9 +966,7 @@ fn handle_input(state: &mut KittyCompositor, event: InputEvent<LibinputInputBack
             );
             ptr.frame(state);
         }
-
         InputEvent::PointerAxis { event } => {
-            use smithay::backend::input::PointerAxisEvent;
             let h = event.amount(Axis::Horizontal).unwrap_or_else(|| {
                 event.amount_v120(Axis::Horizontal).unwrap_or(0.0) * 15.0 / 120.0
             });
@@ -1135,7 +984,6 @@ fn handle_input(state: &mut KittyCompositor, event: InputEvent<LibinputInputBack
             ptr.axis(state, frame);
             ptr.frame(state);
         }
-
         _ => {}
     }
 }
