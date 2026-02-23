@@ -1,5 +1,5 @@
 mod config;
-use config::{Config, KeyAction};
+use config::{Config, FloatingMarker, KeyAction};
 
 use std::{
     collections::HashMap,
@@ -106,12 +106,20 @@ use xkbcommon::xkb;
 pub type GbmDrmCompositor =
     DrmCompositor<GbmAllocator<DrmDeviceFd>, GbmFramebufferExporter<DrmDeviceFd>, (), DrmDeviceFd>;
 
+// ── marker: window rules have been applied to this window ─────────────────────
+// Inserted into Window user_data on the first commit where app_id/title are
+// non-empty, so we never re-apply rules on subsequent commits.
+
+struct RulesApplied;
+
 // ── per-output data ───────────────────────────────────────────────────────────
 
 struct SurfaceData {
     output: Output,
     compositor: GbmDrmCompositor,
     damage_tracker: OutputDamageTracker,
+    frame_interval: Duration,
+    loop_running: bool,
 }
 
 // ── per-GPU data ──────────────────────────────────────────────────────────────
@@ -167,6 +175,70 @@ struct KittyCompositor {
     backends: HashMap<DrmNode, BackendData>,
     primary_gpu: DrmNode,
     wayland_socket: String,
+    render_dirty: bool,
+}
+
+// ── window rule application ───────────────────────────────────────────────────
+// Extracted so it can be called from commit() once app_id/title are available.
+
+fn apply_window_rules(state: &mut KittyCompositor, window: &Window, app_id: &str, title: &str) {
+    let rule = state
+        .config
+        .window_rules
+        .iter()
+        .find(|r| r.matches(app_id, title))
+        .cloned();
+
+    let Some(rule) = rule else { return };
+    if !rule.floating {
+        return;
+    }
+
+    let output_geo = state
+        .space
+        .outputs()
+        .next()
+        .and_then(|o| state.space.output_geometry(o))
+        .unwrap_or_default();
+
+    let sz: smithay::utils::Size<i32, Logical> = rule
+        .size
+        .map(|s| (s[0], s[1]).into())
+        .unwrap_or_else(|| (640, 480).into());
+
+    let pos: Point<i32, Logical> =
+        rule.position
+            .map(|p| (p[0], p[1]).into())
+            .unwrap_or_else(|| {
+                let cx = output_geo.loc.x + (output_geo.size.w - sz.w) / 2;
+                let cy = output_geo.loc.y + (output_geo.size.h - sz.h) / 2;
+                (cx, cy).into()
+            });
+
+    window.user_data().insert_if_missing(|| FloatingMarker {
+        size: Some((sz.w, sz.h)),
+        position: Some((pos.x, pos.y)),
+    });
+
+    if let Some(toplevel) = window.toplevel() {
+        toplevel.with_pending_state(|s| {
+            s.size = Some(sz);
+        });
+        if toplevel.is_initial_configure_sent() {
+            toplevel.send_pending_configure();
+        }
+    }
+
+    state.space.map_element(window.clone(), pos, true);
+    state.space.raise_element(window, true);
+
+    tracing::info!(
+        "Applied floating rule to app_id={:?} title={:?} size={:?} pos={:?}",
+        app_id,
+        title,
+        sz,
+        pos
+    );
 }
 
 // ── DmabufHandler ─────────────────────────────────────────────────────────────
@@ -227,6 +299,67 @@ impl CompositorHandler for KittyCompositor {
         }
         self.popups.commit(surface);
         ensure_initial_configure(surface, &self.space, &mut self.popups);
+
+        // ── window rule application ───────────────────────────────────────────
+        // new_toplevel fires before the client has sent its app_id/title, so we
+        // defer rule matching to the first commit where both are non-empty.
+        // We resolve everything we need from self.space in its own block so the
+        // immutable borrow ends before apply_window_rules takes &mut self.
+        let pending_rule: Option<(Window, String, String)> = {
+            let window = self
+                .space
+                .elements()
+                .find(|w| w.wl_surface().as_deref() == Some(surface))
+                .cloned();
+
+            window.and_then(|w| {
+                if w.user_data().get::<RulesApplied>().is_some() {
+                    return None;
+                }
+                let (app_id, title) = with_states(surface, |states| {
+                    states
+                        .data_map
+                        .get::<XdgToplevelSurfaceData>()
+                        .and_then(|d| d.lock().ok())
+                        .map(|lock| {
+                            (
+                                lock.app_id.clone().unwrap_or_default(),
+                                lock.title.clone().unwrap_or_default(),
+                            )
+                        })
+                })
+                .unwrap_or_default();
+
+                if app_id.is_empty() && title.is_empty() {
+                    return None;
+                }
+                Some((w, app_id, title))
+            })
+        }; // ← immutable borrow of self.space ends here
+
+        if let Some((window, app_id, title)) = pending_rule {
+            apply_window_rules(self, &window, &app_id, &title);
+            // Stamp regardless of whether a rule matched so we never
+            // re-evaluate on subsequent commits.
+            window.user_data().insert_if_missing(|| RulesApplied);
+        }
+
+        self.render_dirty = true;
+        let nodes: Vec<_> = self.backends.keys().copied().collect();
+        for node in nodes {
+            let crtcs: Vec<_> = self.backends[&node].surfaces.keys().copied().collect();
+            for crtc in crtcs {
+                let idle = self
+                    .backends
+                    .get(&node)
+                    .and_then(|b| b.surfaces.get(&crtc))
+                    .map(|s| !s.loop_running)
+                    .unwrap_or(false);
+                if idle {
+                    self.render_surface(node, crtc);
+                }
+            }
+        }
     }
 }
 delegate_compositor!(KittyCompositor);
@@ -296,7 +429,10 @@ impl XdgShellHandler for KittyCompositor {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
         &mut self.xdg_shell_state
     }
+
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
+        // Map the window immediately at a sensible default — rules will be
+        // applied on the first commit once app_id/title are available.
         let size = self
             .space
             .outputs()
@@ -311,9 +447,8 @@ impl XdgShellHandler for KittyCompositor {
         let window = Window::new_wayland_window(surface);
         self.space.map_element(window, (0, 0), true);
     }
+
     fn toplevel_destroyed(&mut self, _: ToplevelSurface) {
-        // Only quit if there are no windows left AND the primary terminal is gone.
-        // We relaunch the terminal if it closes so trixie always has a window.
         if self.space.elements().count() == 0 {
             let (bin, args) = self.config.terminal_cmd();
             tracing::info!("Terminal closed — relaunching {bin}");
@@ -328,11 +463,25 @@ impl XdgShellHandler for KittyCompositor {
                     self.running.store(false, Ordering::SeqCst);
                 }
             }
+        } else {
+            let next_surface = self
+                .space
+                .elements()
+                .next()
+                .and_then(|w| w.wl_surface().map(|s| s.into_owned()));
+            if let Some(surface) = next_surface {
+                let serial = SCOUNTER.next_serial();
+                if let Some(kbd) = self.seat.get_keyboard() {
+                    kbd.set_focus(self, Some(surface), serial);
+                }
+            }
         }
     }
+
     fn new_popup(&mut self, surface: PopupSurface, _: PositionerState) {
         let _ = self.popups.track_popup(PopupKind::Xdg(surface));
     }
+
     fn reposition_request(
         &mut self,
         surface: PopupSurface,
@@ -345,6 +494,7 @@ impl XdgShellHandler for KittyCompositor {
         });
         surface.send_repositioned(token);
     }
+
     fn grab(&mut self, _: PopupSurface, _: wl_seat::WlSeat, _: Serial) {}
 }
 delegate_xdg_shell!(KittyCompositor);
@@ -423,7 +573,6 @@ fn vt_from_keysym(keysym: xkb::Keysym) -> Option<u32> {
     }
 }
 
-/// Spawn a command from a `KeyAction::Spawn`, passing the Wayland socket.
 fn spawn_action(cmd: &str, args: &[String], wayland_socket: &str) {
     let bin = config::expand_tilde(cmd);
     if let Err(e) = Command::new(&bin)
@@ -451,7 +600,6 @@ fn main() {
         .insert_source(
             Generic::new(display, Interest::READ, CalloopMode::Level),
             |_, display, state| {
-                // SAFETY: we are the only user of this display
                 unsafe {
                     display.get_mut().dispatch_clients(state).unwrap();
                 }
@@ -487,8 +635,6 @@ fn main() {
             }
             SessionEvent::ActivateSession => {
                 tracing::info!("Session resumed");
-                // Reassign the seat to wake libinput back up. This re-opens
-                // all device fds that were closed during suspend.
                 if let Err(e) = state
                     .libinput
                     .udev_assign_seat(state.session.seat().as_str())
@@ -519,7 +665,7 @@ fn main() {
         });
     tracing::info!("Primary GPU: {primary_gpu}");
 
-    // ── libinput (constructed early so we can store it in state) ─────────────
+    // ── libinput ──────────────────────────────────────────────────────────────
     let mut libinput_ctx =
         Libinput::new_with_udev::<LibinputSessionInterface<LibSeatSession>>(session.clone().into());
     libinput_ctx
@@ -577,6 +723,7 @@ fn main() {
         primary_gpu,
         wayland_socket: socket_name.clone(),
         libinput: libinput_ctx,
+        render_dirty: true,
     };
 
     // ── udev ──────────────────────────────────────────────────────────────────
@@ -620,7 +767,6 @@ fn main() {
 
     // ── libinput ──────────────────────────────────────────────────────────────
     let libinput_backend = LibinputInputBackend::new(state.libinput.clone());
-
     event_loop
         .handle()
         .insert_source(libinput_backend, |event, _, state| {
@@ -628,12 +774,7 @@ fn main() {
         })
         .unwrap();
 
-    state.handle.insert_idle(|state| state.render_all());
-
     // ── launch terminal ───────────────────────────────────────────────────────
-    // Use terminal_cmd() so that shell-style quoting, inline arguments, and
-    // tilde expansion in the config value are all handled correctly.
-    // e.g. `terminal = "kitty -c ~/.config/trixie/kitty/kitty.conf"` works.
     let running = state.running.clone();
     let (bin, args) = state.config.terminal_cmd();
     println!("Launching {bin} on WAYLAND_DISPLAY={socket_name}");
@@ -644,11 +785,10 @@ fn main() {
         .unwrap_or_else(|e| panic!("Failed to spawn {bin}: {e}"));
 
     while running.load(Ordering::SeqCst) {
-        let _ = event_loop.dispatch(Some(Duration::from_millis(4)), &mut state);
+        let _ = event_loop.dispatch(None, &mut state);
         state.space.refresh();
         state.popups.cleanup();
-        let mut dh = state.display_handle.clone();
-        dh.flush_clients().unwrap();
+        state.display_handle.clone().flush_clients().unwrap();
     }
 }
 
@@ -671,7 +811,7 @@ fn add_gpu(
     let gbm = GbmDevice::new(drm_fd.clone())?;
     let egl = unsafe { EGLDisplay::new(gbm.clone())? };
     let ctx = EGLContext::new(&egl)?;
-    let mut renderer = unsafe { GlesRenderer::new(ctx)? };
+    let renderer = unsafe { GlesRenderer::new(ctx)? };
 
     if let Err(e) = egl.bind_wl_display(dh) {
         tracing::warn!("EGL bind_wl_display failed (hw-accel unavailable): {e}");
@@ -789,6 +929,16 @@ fn add_output(
         None::<GbmDevice<DrmDeviceFd>>,
     )?;
 
+    let vrefresh = drm_mode.vrefresh().max(1);
+    let frame_interval = Duration::from_micros(1_000_000 / vrefresh as u64);
+    tracing::info!(
+        "Output {node}-{crtc:?}: {}x{}@{}Hz → frame interval {}µs",
+        drm_mode.size().0,
+        drm_mode.size().1,
+        vrefresh,
+        frame_interval.as_micros(),
+    );
+
     let damage_tracker = OutputDamageTracker::from_output(&output);
     backend.surfaces.insert(
         crtc,
@@ -796,8 +946,19 @@ fn add_output(
             output,
             compositor,
             damage_tracker,
+            frame_interval,
+            loop_running: false,
         },
     );
+
+    let handle = state.handle.clone();
+    handle
+        .insert_source(Timer::from_duration(frame_interval), move |_, _, state| {
+            state.render_surface(node, crtc);
+            TimeoutAction::Drop
+        })
+        .ok();
+
     Ok(())
 }
 
@@ -823,13 +984,18 @@ impl KittyCompositor {
         };
 
         let output = surface_data.output.clone();
+        let frame_interval = surface_data.frame_interval;
         let output_size = output
             .current_mode()
             .map(|m| m.size.to_logical(1))
             .unwrap_or_default();
 
+        // Resize tiled windows to fill the output; leave floating windows alone.
         let windows: Vec<_> = self.space.elements().cloned().collect();
         for window in &windows {
+            if window.user_data().get::<FloatingMarker>().is_some() {
+                continue;
+            }
             if let Some(toplevel) = window.toplevel() {
                 let needs = toplevel.with_pending_state(|s| {
                     if s.size != Some(output_size) {
@@ -845,6 +1011,16 @@ impl KittyCompositor {
                 self.space.map_element(window.clone(), (0, 0), false);
             }
         }
+
+        if !self.render_dirty {
+            if let Some(b) = self.backends.get_mut(&node) {
+                if let Some(s) = b.surfaces.get_mut(&crtc) {
+                    s.loop_running = false;
+                }
+            }
+            return;
+        }
+        self.render_dirty = false;
 
         let backend = self.backends.get_mut(&node).unwrap();
         let surface_data = backend.surfaces.get_mut(&crtc).unwrap();
@@ -870,31 +1046,26 @@ impl KittyCompositor {
         match render_res {
             Ok(frame) => {
                 if !frame.is_empty {
+                    surface_data.loop_running = true;
                     if let Err(e) = surface_data.compositor.queue_frame(()) {
                         tracing::warn!("queue_frame: {e}");
+                        surface_data.loop_running = false;
                     }
+                } else {
+                    surface_data.loop_running = false;
                 }
                 let now = self.clock.now();
                 for window in self.space.elements().cloned().collect::<Vec<_>>() {
-                    window.send_frame(&output, now, Some(Duration::from_secs(1)), |_, _| {
+                    window.send_frame(&output, now, Some(frame_interval), |_, _| {
                         Some(output.clone())
                     });
                 }
             }
-            Err(e) => tracing::warn!("render_frame: {e}"),
+            Err(e) => {
+                tracing::warn!("render_frame: {e}");
+                surface_data.loop_running = false;
+            }
         }
-
-        // Fallback ~60 Hz timer keeps the loop alive when frames are empty.
-        let handle = self.handle.clone();
-        handle
-            .insert_source(
-                Timer::from_duration(Duration::from_millis(16)),
-                move |_, _, state| {
-                    state.render_surface(node, crtc);
-                    TimeoutAction::Drop
-                },
-            )
-            .ok();
     }
 
     fn frame_finish(&mut self, node: DrmNode, crtc: crtc::Handle) {
@@ -956,7 +1127,7 @@ fn handle_input(state: &mut KittyCompositor, event: InputEvent<LibinputInputBack
                         return FilterResult::Forward;
                     }
 
-                    // ── VT switching (Ctrl+Alt+F1-F12) — checked first ────────
+                    // ── VT switching ──────────────────────────────────────────
                     if mods.ctrl && mods.alt {
                         let base_sym = keysym_handle
                             .raw_syms()
@@ -966,7 +1137,6 @@ fn handle_input(state: &mut KittyCompositor, event: InputEvent<LibinputInputBack
 
                         let vt = vt_from_keysym(keysym_handle.modified_sym()).or_else(|| {
                             let raw = base_sym.raw();
-                            // XKB_KEY_F1=0xFFBE … XKB_KEY_F12=0xFFC9
                             if raw >= 0xFFBE && raw <= 0xFFC9 {
                                 Some(raw - 0xFFBE + 1)
                             } else {
@@ -997,7 +1167,9 @@ fn handle_input(state: &mut KittyCompositor, event: InputEvent<LibinputInputBack
                         if !config::mods_match(mods, &bind.mods) {
                             continue;
                         }
-                        let name = xkb::keysym_get_name(keysym_handle.modified_sym());
+                        let name = config::normalise_key_name(&xkb::keysym_get_name(
+                            keysym_handle.modified_sym(),
+                        ));
                         if name != bind.key {
                             continue;
                         }
@@ -1006,7 +1178,18 @@ fn handle_input(state: &mut KittyCompositor, event: InputEvent<LibinputInputBack
                                 state.running.store(false, Ordering::SeqCst);
                             }
                             KeyAction::CloseWindow => {
-                                if let Some(w) = state.space.elements().next().cloned() {
+                                let focused_surface =
+                                    state.seat.get_keyboard().and_then(|k| k.current_focus());
+                                let target = focused_surface
+                                    .and_then(|fs| {
+                                        state
+                                            .space
+                                            .elements()
+                                            .find(|w| w.wl_surface().as_deref() == Some(&fs))
+                                            .cloned()
+                                    })
+                                    .or_else(|| state.space.elements().next().cloned());
+                                if let Some(w) = target {
                                     if let Some(t) = w.toplevel() {
                                         t.send_close();
                                     }
