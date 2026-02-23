@@ -1,7 +1,29 @@
 [package]
-name = "Trixie"
+name = "kitty-compositor"
 version = "0.1.0"
-edition = "2024"
-descriotion = "The final solution of DE's"
+edition = "2021"
+
+[[bin]]
+name = "kitty-compositor"
+path = "src/main.rs"
 
 [dependencies]
+smithay = { version = "0.7.0", features = [
+    "backend_drm",
+    "backend_gbm",
+    "backend_udev",
+    "backend_libinput",
+    "backend_egl",
+    "backend_session_libseat",
+    "renderer_gl",
+    "wayland_frontend",
+    "desktop",
+    "use_system_lib",
+] }
+rustix = { version = "1.0", features = ["fs"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+toml = "1.0.3"
+xkb = "0.3.0"
