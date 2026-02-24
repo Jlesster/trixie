@@ -4,14 +4,14 @@
 // Files are merged in alphabetical order. Recognised filenames and the keys
 // they are expected to carry (all optional, unknown keys are silently ignored):
 //
-//   general.json  →  terminal, seat_name, background_color
+//   general.json  →  terminal, seat_name, background_color,
+//                    target_hz, vsync,
+//                    vibrance { enabled, strength, balance }
 //   keyboard.json →  keyboard  { layout, variant, options, repeat_delay, repeat_rate }
 //   keymaps.json  →  keybinds  [ { mods, key, action } … ]
 //   rules.json    →  window_rules [ { app_id, title, floating, size, position } … ]
-//
-// Any file may contain any subset of the above keys; they are all merged into
-// a single Config.  Unknown top-level keys are ignored (no deny_unknown_fields
-// at the root level) so users can freely split things however they like.
+//   autostart.json → exec      [ { command, args? } … ]
+//                    exec_once [ { command, args? } … ]
 
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -23,27 +23,119 @@ pub struct Config {
     pub terminal: String,
     pub seat_name: String,
     pub background_color: [f32; 4],
+    pub target_hz: Option<u64>,
+    pub vsync: VsyncMode,
+    pub vibrance: VibranceConfig,
     pub keyboard: KeyboardConfig,
     pub keybinds: Vec<Keybind>,
     pub window_rules: Vec<WindowRule>,
+    pub exec: Vec<ExecEntry>,
+    pub exec_once: Vec<ExecEntry>,
 }
 
-/// Serde target for a single JSON file — every field is optional so partial
-/// files work without errors.
+impl Config {
+    pub fn frame_duration_for(&self, connector_hz: u64) -> std::time::Duration {
+        let hz = match self.target_hz {
+            Some(cap) => cap.min(connector_hz).max(1),
+            None => connector_hz.max(1),
+        };
+        std::time::Duration::from_micros(1_000_000 / hz)
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct RawConfig {
     terminal: Option<String>,
     seat_name: Option<String>,
     background_color: Option<[f32; 4]>,
+    target_hz: Option<u64>,
+    vsync: Option<VsyncMode>,
+    vibrance: Option<RawVibranceConfig>,
     #[serde(default)]
     keyboard: RawKeyboardConfig,
     #[serde(default)]
     keybinds: Vec<Keybind>,
     #[serde(default)]
     window_rules: Vec<WindowRule>,
+    #[serde(default)]
+    exec: Vec<ExecEntry>,
+    #[serde(default)]
+    exec_once: Vec<ExecEntry>,
 }
 
-// ── keyboard sub-table ────────────────────────────────────────────────────────
+// ── vibrance ──────────────────────────────────────────────────────────────────
+
+/// Vibrance post-processing settings.
+///
+/// JSON shape (all fields optional):
+/// ```json
+/// "vibrance": {
+///     "enabled":  true,
+///     "strength": 0.45,
+///     "balance":  [1.0, 1.0, 1.0]
+/// }
+/// ```
+/// `strength` ranges from -1.0 (desaturate) to 1.0 (saturate). Default 0.45.
+/// `balance`  per-channel RGB weight applied to the vibrance coefficient.
+#[derive(Debug, Clone)]
+pub struct VibranceConfig {
+    pub enabled: bool,
+    pub strength: f32,
+    pub balance: [f32; 3],
+}
+
+impl Default for VibranceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            strength: 0.45,
+            balance: [1.0, 1.0, 1.0],
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawVibranceConfig {
+    enabled: Option<bool>,
+    strength: Option<f32>,
+    balance: Option<[f32; 3]>,
+}
+
+impl RawVibranceConfig {
+    fn merge_into(self, dst: &mut VibranceConfig) {
+        if let Some(e) = self.enabled {
+            dst.enabled = e;
+        }
+        if let Some(s) = self.strength {
+            dst.strength = s.clamp(-1.0, 1.0);
+        }
+        if let Some(b) = self.balance {
+            dst.balance = b;
+        }
+    }
+}
+
+// ── vsync mode ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VsyncMode {
+    #[default]
+    On,
+    Off,
+    Adaptive,
+}
+
+// ── exec entry ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ExecEntry {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+// ── keyboard ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct KeyboardConfig {
@@ -86,8 +178,6 @@ pub struct Keybind {
 }
 
 impl Keybind {
-    /// Return a normalised copy: mods lowercased, key name lowercased.
-    /// Normalisation happens once at load time so hot-path matching is cheap.
     fn normalise(mut self) -> Self {
         self.mods = self.mods.into_iter().map(|m| m.to_lowercase()).collect();
         self.key = self.key.to_lowercase();
@@ -100,6 +190,7 @@ impl Keybind {
 pub enum KeyAction {
     Quit,
     CloseWindow,
+    ReloadConfig,
     Spawn {
         command: String,
         #[serde(default)]
@@ -111,29 +202,21 @@ pub enum KeyAction {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct WindowRule {
-    /// Substring match against the XDG app-id.
     pub app_id: Option<String>,
-    /// Substring match against the XDG title.
     pub title: Option<String>,
     #[serde(default)]
     pub floating: bool,
-    /// Fixed logical size [width, height].  `null` → use rule default / centre.
     pub size: Option<[i32; 2]>,
-    /// Fixed logical position [x, y].  `null` → centre on output.
     pub position: Option<[i32; 2]>,
 }
 
 impl WindowRule {
-    /// Returns true when both constraints (if present) match.
     pub fn matches(&self, app_id: &str, title: &str) -> bool {
         self.app_id.as_deref().map_or(true, |p| app_id.contains(p))
             && self.title.as_deref().map_or(true, |p| title.contains(p))
     }
 }
 
-/// Inserted into a Window's `user_data` map for every window that matched a
-/// floating rule.  `render_surface` checks for this marker to skip the
-/// full-output resize step.
 #[derive(Debug)]
 pub struct FloatingMarker {
     pub size: Option<(i32, i32)>,
@@ -148,6 +231,9 @@ impl Default for Config {
             terminal: "kitty".into(),
             seat_name: "seat0".into(),
             background_color: [0.05, 0.05, 0.05, 1.0],
+            target_hz: None,
+            vsync: VsyncMode::On,
+            vibrance: VibranceConfig::default(),
             keyboard: KeyboardConfig::default(),
             keybinds: vec![Keybind {
                 mods: vec!["super".into(), "shift".into()],
@@ -155,6 +241,8 @@ impl Default for Config {
                 action: KeyAction::Quit,
             }],
             window_rules: vec![],
+            exec: vec![],
+            exec_once: vec![],
         }
     }
 }
@@ -162,14 +250,10 @@ impl Default for Config {
 // ── loading ───────────────────────────────────────────────────────────────────
 
 impl Config {
-    /// Load and merge all `*.json` files found in the config directory.
-    /// Silently falls back to `Config::default()` when the directory does not
-    /// exist or contains no JSON files.
     pub fn load() -> Self {
         let dir = Self::config_dir();
         tracing::info!("Config dir: {}", dir.display());
 
-        // Collect *.json paths, sorted so load order is deterministic.
         let mut paths: Vec<PathBuf> = match std::fs::read_dir(&dir) {
             Ok(rd) => rd
                 .filter_map(|e| e.ok())
@@ -191,12 +275,11 @@ impl Config {
             return Config::default();
         }
 
-        // Start from built-in defaults, then overlay each file.
         let mut cfg = Config::default();
-        // Reset keybinds/rules so they don't duplicate the baked-in defaults
-        // when the user has provided their own files.
         cfg.keybinds.clear();
         cfg.window_rules.clear();
+        cfg.exec.clear();
+        cfg.exec_once.clear();
         let mut has_keybinds = false;
 
         for path in &paths {
@@ -216,7 +299,6 @@ impl Config {
                 }
             };
 
-            // Scalar overrides.
             if let Some(t) = raw.terminal {
                 cfg.terminal = t;
             }
@@ -226,9 +308,16 @@ impl Config {
             if let Some(b) = raw.background_color {
                 cfg.background_color = b;
             }
+            if let Some(h) = raw.target_hz {
+                cfg.target_hz = Some(h);
+            }
+            if let Some(v) = raw.vsync {
+                cfg.vsync = v;
+            }
+            if let Some(vib) = raw.vibrance {
+                vib.merge_into(&mut cfg.vibrance);
+            }
 
-            // Keyboard: merge individual fields so keyboard.json only needs the
-            // keys the user actually wants to change.
             let rk = raw.keyboard;
             if rk.layout.is_some() {
                 cfg.keyboard.layout = rk.layout;
@@ -246,27 +335,30 @@ impl Config {
                 cfg.keyboard.repeat_rate = r;
             }
 
-            // Lists are accumulated across files.
-            // Normalise at load time so hot-path matching never has to case-fold.
             if !raw.keybinds.is_empty() {
                 has_keybinds = true;
                 cfg.keybinds
                     .extend(raw.keybinds.into_iter().map(Keybind::normalise));
             }
             cfg.window_rules.extend(raw.window_rules);
+            cfg.exec.extend(raw.exec);
+            cfg.exec_once.extend(raw.exec_once);
         }
 
-        // If no file provided keybinds, restore the built-in quit shortcut so
-        // the compositor is not completely impossible to exit.
         if !has_keybinds {
             cfg.keybinds = Config::default().keybinds;
         }
 
+        tracing::info!(
+            "Config loaded — vsync={:?} target_hz={:?} vibrance={} strength={:.2}",
+            cfg.vsync,
+            cfg.target_hz,
+            cfg.vibrance.enabled,
+            cfg.vibrance.strength
+        );
         cfg
     }
 
-    /// Returns the config directory, honouring `$TRIXIE_CONFIG_DIR` and
-    /// `$XDG_CONFIG_HOME` in that order.
     pub fn config_dir() -> PathBuf {
         if let Ok(p) = std::env::var("TRIXIE_CONFIG_DIR") {
             return PathBuf::from(p);
@@ -279,7 +371,6 @@ impl Config {
         base.join("trixie")
     }
 
-    /// Split `self.terminal` into (binary, args), respecting shell-style quoting.
     pub fn terminal_cmd(&self) -> (String, Vec<String>) {
         let mut parts = shell_words(&self.terminal);
         if parts.is_empty() {
@@ -291,12 +382,10 @@ impl Config {
     }
 }
 
-// ── modifier matching helper ──────────────────────────────────────────────────
+// ── modifier matching ─────────────────────────────────────────────────────────
 
 use smithay::input::keyboard::ModifiersState;
 
-/// Check that the live modifier state matches the keybind's required modifiers.
-/// Both sides are already lowercase (mods normalised at load, strings are literals).
 pub fn mods_match(mods: &ModifiersState, required: &[String]) -> bool {
     mods.logo == required.iter().any(|m| m == "super")
         && mods.shift == required.iter().any(|m| m == "shift")
@@ -304,15 +393,12 @@ pub fn mods_match(mods: &ModifiersState, required: &[String]) -> bool {
         && mods.alt == required.iter().any(|m| m == "alt")
 }
 
-/// Normalise an xkb key name to lowercase for case-insensitive matching
-/// against the (already-lowercased) `key` field in Keybind.
 pub fn normalise_key_name(name: &str) -> String {
     name.to_lowercase()
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-/// Expand a leading `~` to `$HOME`.
 pub fn expand_tilde(s: &str) -> String {
     if s.starts_with('~') {
         let home = std::env::var("HOME").unwrap_or_default();
@@ -322,12 +408,10 @@ pub fn expand_tilde(s: &str) -> String {
     }
 }
 
-/// Minimal shell-word splitter: handles single/double quotes and backslash escapes.
 fn shell_words(s: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut cur = String::new();
     let mut chars = s.chars().peekable();
-
     while let Some(c) = chars.next() {
         match c {
             ' ' | '\t' if cur.is_empty() => {}
