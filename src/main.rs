@@ -2,9 +2,14 @@
 
 mod backend;
 mod config;
+mod embedded_ipc;
+mod embedded_window;
 mod handlers;
 mod input;
 mod render;
+mod shader_config;
+mod shader_ipc;
+mod shader_pass;
 mod state;
 
 // expose reload_config to input.rs via crate::main_loop
@@ -13,7 +18,8 @@ pub mod main_loop {
 }
 
 use config::{Config, ExecEntry, VsyncMode};
-use state::{ClientState, KittyCompositor};
+use shader_pass::ShaderPass;
+use state::{ClientState, KittyCompositor, MouseMode};
 
 use notify::{EventKind, RecursiveMode, Watcher};
 use std::{
@@ -74,6 +80,16 @@ pub fn reload_config(state: &mut KittyCompositor) {
     state.config.window_rules = new.window_rules;
     state.config.exec = new.exec.clone();
     run_exec(state);
+
+    // Reload shader registry and recompile any changed sources.
+    state.config.shaders = new.shaders;
+    let changed = state.config.shaders.hot_reload();
+    state.shader_pass.sync_programs(&state.config.shaders);
+    for name in changed {
+        state
+            .shader_pass
+            .recompile_shader(&state.config.shaders, &name);
+    }
 
     if new.keyboard.repeat_delay != state.config.keyboard.repeat_delay
         || new.keyboard.repeat_rate != state.config.keyboard.repeat_rate
@@ -259,6 +275,8 @@ fn main() {
     )
     .unwrap();
 
+    let start_time = std::time::Instant::now();
+
     let mut state = KittyCompositor {
         display_handle: dh.clone(),
         running: Arc::new(AtomicBool::new(true)),
@@ -281,12 +299,15 @@ fn main() {
         seat,
         pointer,
         cursor_status: CursorImageStatus::default_named(),
+        mouse_mode: MouseMode::Normal,
         session,
         backends: Default::default(),
         primary_gpu,
         wayland_socket: socket_name.clone(),
         libinput: libinput_ctx,
         exec_once_done: false,
+        shader_pass: ShaderPass::new(start_time),
+        start_time,
     };
 
     // ── udev ──────────────────────────────────────────────────────────────────
@@ -306,6 +327,72 @@ fn main() {
             .dmabuf_state
             .create_global::<KittyCompositor>(&dh, formats);
         state.dmabuf_global = Some(global);
+    }
+
+    // Compile shaders now that the GL context exists.
+    state.shader_pass.sync_programs(&state.config.shaders);
+
+    // IPC socket for the ratatui shader manager.
+    {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let ipc_path = shader_ipc::socket_path();
+        let _ = std::fs::remove_file(&ipc_path);
+        match UnixListener::bind(&ipc_path) {
+            Ok(listener) => {
+                listener.set_nonblocking(true).ok();
+                tracing::info!("Shader IPC socket: {}", ipc_path.display());
+                event_loop
+                    .handle()
+                    .insert_source(
+                        Generic::new(listener, Interest::READ, CalloopMode::Level),
+                        |_, listener, state| {
+                            loop {
+                                match listener.accept() {
+                                    Ok((mut stream, _)) => {
+                                        stream.set_nonblocking(false).ok();
+                                        let mut line = String::new();
+                                        if BufReader::new(stream.try_clone().unwrap())
+                                            .read_line(&mut line)
+                                            .is_err()
+                                        {
+                                            continue;
+                                        }
+                                        let trimmed = line.trim();
+                                        if trimmed.is_empty() {
+                                            continue;
+                                        }
+                                        if let Ok(cmd) =
+                                            serde_json::from_str::<shader_ipc::IpcCommand>(trimmed)
+                                        {
+                                            let mut recompile = Vec::new();
+                                            let resp = shader_ipc::dispatch_command_with_registry(
+                                                cmd,
+                                                &mut state.config.shaders,
+                                                &mut recompile,
+                                            );
+                                            for name in recompile {
+                                                state
+                                                    .shader_pass
+                                                    .recompile_shader(&state.config.shaders, &name);
+                                            }
+                                            if let Ok(mut json) = serde_json::to_string(&resp) {
+                                                json.push('\n');
+                                                stream.write_all(json.as_bytes()).ok();
+                                            }
+                                        }
+                                    }
+                                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                    Err(_) => break,
+                                }
+                            }
+                            Ok(PostAction::Continue)
+                        },
+                    )
+                    .ok();
+            }
+            Err(e) => tracing::warn!("Could not bind shader IPC socket: {e}"),
+        }
     }
 
     event_loop
@@ -358,11 +445,13 @@ fn main() {
                 ev.kind,
                 EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
             );
-            let affects_json = ev
-                .paths
-                .iter()
-                .any(|p| p.extension().and_then(|e| e.to_str()) == Some("json"));
-            if is_write && affects_json {
+            let affects_config = ev.paths.iter().any(|p| {
+                matches!(
+                    p.extension().and_then(|e| e.to_str()),
+                    Some("json") | Some("glsl")
+                )
+            });
+            if is_write && affects_config {
                 let _ = tx.send(());
             }
         })
@@ -370,7 +459,8 @@ fn main() {
     .expect("Failed to create config file watcher");
 
     if config_dir.exists() {
-        if let Err(e) = watcher.watch(&config_dir, RecursiveMode::NonRecursive) {
+        // Recursive so changes to shaders/*.glsl are also caught.
+        if let Err(e) = watcher.watch(&config_dir, RecursiveMode::Recursive) {
             tracing::warn!("Could not watch config dir {}: {e}", config_dir.display());
         } else {
             tracing::info!("Watching config dir for changes: {}", config_dir.display());

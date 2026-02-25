@@ -105,6 +105,17 @@ impl CompositorHandler for KittyCompositor {
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
 
+        // If this surface belongs to an embedded entry, import its buffer now.
+        // We need the renderer from the primary GPU's backend.
+        if self.embedded.is_embedded_surface(surface) {
+            if let Some(b) = self.backends.get_mut(&self.primary_gpu) {
+                self.embedded.on_commit(&mut b.renderer, surface);
+            }
+            // Embedded surfaces don't participate in Space configure logic.
+            return;
+        }
+
+        // Normal path.
         if !is_sync_subsurface(surface) {
             let mut root = surface.clone();
             while let Some(p) = get_parent(&root) {
@@ -206,11 +217,46 @@ impl XdgShellHandler for KittyCompositor {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
+        // Read the app_id from pending state before deciding what to do.
+        let app_id = surface.current_state().app_id.clone().unwrap_or_default();
+
+        // If EmbeddedManager has a pending reservation for this app_id,
+        // claim the surface — it won't be mapped into Space at all.
+        let wl = surface.wl_surface().clone();
+        if self.embedded.try_claim(&app_id, wl, surface.clone()) {
+            // Surface is now owned by EmbeddedManager.
+            // Update the IPC window list so List commands return current state.
+            let statuses = self.embedded.window_statuses();
+            self.embed_ipc.update_windows(statuses);
+            return;
+        }
+
+        // Normal path: map as a tiled window.
         let window = Window::new_wayland_window(surface);
         self.space.map_element(window, (0, 0), false);
     }
 
-    fn toplevel_destroyed(&mut self, _: ToplevelSurface) {
+    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        // Check if this was an embedded surface being destroyed.
+        let wl = surface.wl_surface();
+        if self.embedded.is_embedded_surface(wl) {
+            // Find its app_id and remove it.
+            let app_id = self
+                .embedded
+                .entries
+                .iter()
+                .find(|(_, e)| &e.surface == wl)
+                .map(|(id, _)| id.clone());
+            if let Some(id) = app_id {
+                tracing::info!("Embedded surface '{}' destroyed", id);
+                self.embedded.remove(&id);
+                let statuses = self.embedded.window_statuses();
+                self.embed_ipc.update_windows(statuses);
+            }
+            return;
+        }
+
+        // Normal tiled window destroyed.
         if self.space.elements().count() == 0 {
             let (bin, args) = self.config.terminal_cmd();
             tracing::info!("Terminal closed — relaunching {bin}");
@@ -231,10 +277,10 @@ impl XdgShellHandler for KittyCompositor {
                 .elements()
                 .next()
                 .and_then(|w| w.wl_surface().map(|s| s.into_owned()));
-            if let Some(surface) = next {
+            if let Some(s) = next {
                 let serial = SCOUNTER.next_serial();
                 if let Some(kbd) = self.seat.get_keyboard() {
-                    kbd.set_focus(self, Some(surface), serial);
+                    kbd.set_focus(self, Some(s), serial);
                 }
             }
         }

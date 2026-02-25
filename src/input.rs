@@ -26,7 +26,7 @@ use xkbcommon::xkb;
 use crate::{
     config::{self, KeyAction},
     render::surface_under,
-    state::KittyCompositor,
+    state::{KittyCompositor, MouseMode},
 };
 
 // ── vt keysym helper ──────────────────────────────────────────────────────────
@@ -124,8 +124,27 @@ fn handle_keyboard(
                 }
             }
 
-            // ── user keybinds ─────────────────────────────────────────────────
             let pressed_sym = keysym_handle.modified_sym();
+            let name = config::normalise_key_name(&xkb::keysym_get_name(pressed_sym));
+
+            // ── mouse mode switching — checked before user keybinds ────────────
+            // Super+i → Insert (compositor handles pointer, glyph visible)
+            if mods.logo && !mods.shift && !mods.ctrl && !mods.alt && name == "i" {
+                if state.mouse_mode != MouseMode::Insert {
+                    tracing::info!("Mouse mode → Insert");
+                    state.mouse_mode = MouseMode::Insert;
+                    return FilterResult::Intercept(());
+                }
+            }
+            // Escape or Super+[ → Normal (passthrough, glyph hidden)
+            if name == "escape" || (mods.logo && name == "bracketleft") {
+                if state.mouse_mode != MouseMode::Normal {
+                    tracing::info!("Mouse mode → Normal");
+                    state.mouse_mode = MouseMode::Normal;
+                    return FilterResult::Intercept(());
+                }
+            }
+
             tracing::debug!(
                 "key pressed: sym={} super:{} shift:{} ctrl:{} alt:{}",
                 xkb::keysym_get_name(pressed_sym),
@@ -135,8 +154,7 @@ fn handle_keyboard(
                 mods.alt,
             );
 
-            let name = config::normalise_key_name(&xkb::keysym_get_name(pressed_sym));
-
+            // ── user keybinds ─────────────────────────────────────────────────
             for i in 0..state.config.keybinds.len() {
                 if !config::mods_match(mods, &state.config.keybinds[i].mods) {
                     continue;
@@ -196,7 +214,14 @@ fn handle_pointer_motion_abs(
         .unwrap_or_default();
     let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
     let serial = SCOUNTER.next_serial();
-    let under = surface_under(&state.space, pos);
+
+    // Always update the internal pointer position so it's correct when
+    // switching back to Insert, but only send motion to clients in Normal mode.
+    let under = match state.mouse_mode {
+        MouseMode::Normal => surface_under(&state.space, pos),
+        MouseMode::Insert => None, // don't forward to surfaces in Insert
+    };
+
     let ptr = state.pointer.clone();
     ptr.motion(
         state,
@@ -231,7 +256,12 @@ fn handle_pointer_motion(
             .clamp(geo.loc.y as f64, (geo.loc.y + geo.size.h) as f64);
     }
     let serial = SCOUNTER.next_serial();
-    let under = surface_under(&state.space, pos);
+
+    let under = match state.mouse_mode {
+        MouseMode::Normal => surface_under(&state.space, pos),
+        MouseMode::Insert => None,
+    };
+
     let ptr = state.pointer.clone();
     ptr.motion(
         state,
@@ -254,42 +284,52 @@ fn handle_pointer_button(
     let serial = SCOUNTER.next_serial();
     let btn_state = wl_pointer::ButtonState::from(event.state());
 
-    if btn_state == wl_pointer::ButtonState::Pressed {
-        let pos = state.pointer.current_location();
-        let (window, surface) = {
-            let w = state
-                .space
-                .element_under(pos)
-                .map(|(w, _)| w.clone())
-                .or_else(|| state.space.elements().next().cloned());
-            let s = w
-                .as_ref()
-                .and_then(|w| w.wl_surface().map(|s| s.into_owned()));
-            (w, s)
-        };
-        if let Some(w) = &window {
-            state.space.raise_element(w, true);
+    match state.mouse_mode {
+        // ── Normal: pass click straight through to the focused surface ────────
+        MouseMode::Normal => {
+            let ptr = state.pointer.clone();
+            ptr.button(
+                state,
+                &ButtonEvent {
+                    button: event.button_code(),
+                    state: btn_state.try_into().unwrap(),
+                    serial,
+                    time: event.time_msec(),
+                },
+            );
+            ptr.frame(state);
         }
-        if let Some(s) = surface {
-            state
-                .seat
-                .get_keyboard()
-                .unwrap()
-                .set_focus(state, Some(s), serial);
+
+        // ── Insert: focus/raise on press, stay in Insert, don't forward ───────
+        MouseMode::Insert => {
+            if btn_state == wl_pointer::ButtonState::Pressed {
+                let pos = state.pointer.current_location();
+                let (window, surface) = {
+                    let w = state
+                        .space
+                        .element_under(pos)
+                        .map(|(w, _)| w.clone())
+                        .or_else(|| state.space.elements().next().cloned());
+                    let s = w
+                        .as_ref()
+                        .and_then(|w| w.wl_surface().map(|s| s.into_owned()));
+                    (w, s)
+                };
+                if let Some(w) = &window {
+                    state.space.raise_element(w, true);
+                }
+                if let Some(s) = surface {
+                    state
+                        .seat
+                        .get_keyboard()
+                        .unwrap()
+                        .set_focus(state, Some(s), serial);
+                }
+                // Do not forward the click to the surface — Insert mode only
+                // manages focus, it doesn't pass pointer events through.
+            }
         }
     }
-
-    let ptr = state.pointer.clone();
-    ptr.button(
-        state,
-        &ButtonEvent {
-            button: event.button_code(),
-            state: btn_state.try_into().unwrap(),
-            serial,
-            time: event.time_msec(),
-        },
-    );
-    ptr.frame(state);
 }
 
 // ── pointer axis ──────────────────────────────────────────────────────────────
@@ -298,6 +338,12 @@ fn handle_pointer_axis(
     state: &mut KittyCompositor,
     event: <LibinputInputBackend as smithay::backend::input::InputBackend>::PointerAxisEvent,
 ) {
+    // Scroll is forwarded in Normal mode (app owns the mouse), suppressed in
+    // Insert mode (compositor owns the mouse, no app to scroll).
+    if state.mouse_mode == MouseMode::Insert {
+        return;
+    }
+
     let h = event
         .amount(Axis::Horizontal)
         .unwrap_or_else(|| event.amount_v120(Axis::Horizontal).unwrap_or(0.0) * 15.0 / 120.0);

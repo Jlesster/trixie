@@ -13,6 +13,7 @@
 //   autostart.json → exec      [ { command, args? } … ]
 //                    exec_once [ { command, args? } … ]
 
+use crate::shader_config::ShaderRegistry;
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -31,6 +32,7 @@ pub struct Config {
     pub window_rules: Vec<WindowRule>,
     pub exec: Vec<ExecEntry>,
     pub exec_once: Vec<ExecEntry>,
+    pub shaders: ShaderRegistry,
 }
 
 impl Config {
@@ -38,6 +40,11 @@ impl Config {
         let hz = match self.target_hz {
             Some(cap) => cap.min(connector_hz).max(1),
             None => connector_hz.max(1),
+        };
+        let hz = if hz == 0 {
+            self.target_hz.unwrap_or(60).max(1)
+        } else {
+            hz
         };
         std::time::Duration::from_micros(1_000_000 / hz)
     }
@@ -243,6 +250,7 @@ impl Default for Config {
             window_rules: vec![],
             exec: vec![],
             exec_once: vec![],
+            shaders: ShaderRegistry::default(),
         }
     }
 }
@@ -348,6 +356,8 @@ impl Config {
         if !has_keybinds {
             cfg.keybinds = Config::default().keybinds;
         }
+
+        cfg.shaders = ShaderRegistry::load(&Self::config_dir());
 
         tracing::info!(
             "Config loaded — vsync={:?} target_hz={:?} vibrance={} strength={:.2}",
