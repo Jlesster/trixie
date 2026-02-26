@@ -31,7 +31,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc,
     },
-  
+    time::Duration,
 };
 
 use smithay::{

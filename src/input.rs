@@ -165,7 +165,8 @@ fn handle_keyboard(
             // NOTE: Super+Return is deliberately NOT bound here.  trixterm
             // owns that key for TWM takeover.  The compositor forwards it.
             for i in 0..state.config.keybinds.len() {
-                if !config::mods_match(mods, &state.config.keybinds[i].mods) {
+                if !config::mods_match(mods, &state.config.keybinds[i].mods, &state.config.keyboard)
+                {
                     continue;
                 }
                 if name != state.config.keybinds[i].key {

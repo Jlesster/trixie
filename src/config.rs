@@ -15,7 +15,6 @@
 //   rules.conf     →  windowrule = <action>, <matcher>[, size W H][, pos X Y]
 //   autostart.conf →  exec      = <command>
 //                     exec_once = <command>
-
 use crate::shader_config::ShaderRegistry;
 use crate::util::{expand_tilde, hex4, resolve_path, shell_words, strip_comment};
 use std::path::{Path, PathBuf};
@@ -671,11 +670,22 @@ fn parse_color_f32(s: &str) -> Option<[f32; 4]> {
 
 use smithay::input::keyboard::ModifiersState;
 
-pub fn mods_match(mods: &ModifiersState, required: &[String]) -> bool {
-    mods.logo == required.iter().any(|m| m == "super")
-        && mods.shift == required.iter().any(|m| m == "shift")
-        && mods.ctrl == required.iter().any(|m| m == "ctrl")
-        && mods.alt == required.iter().any(|m| m == "alt")
+pub fn mods_match(mods: &ModifiersState, required: &[String], keyboard: &KeyboardConfig) -> bool {
+    let wants_super = required.iter().any(|m| m == "super");
+    let wants_shift = required.iter().any(|m| m == "shift");
+    let wants_ctrl = required.iter().any(|m| m == "ctrl");
+    let wants_alt = required.iter().any(|m| m == "alt");
+
+    let super_held = match keyboard.modifier {
+        Modifier::Super => mods.logo,
+        Modifier::Alt => mods.alt,
+        Modifier::Ctrl => mods.ctrl,
+    };
+
+    mods.shift == wants_shift
+        && mods.ctrl == wants_ctrl
+        && mods.alt == wants_alt
+        && super_held == wants_super
 }
 
 pub fn normalise_key_name(name: &str) -> String {
