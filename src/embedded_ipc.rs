@@ -56,7 +56,7 @@ pub fn socket_path() -> PathBuf {
 
 // ── wire types ────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum EmbedCommand {
     Spawn {
@@ -84,7 +84,7 @@ pub enum EmbedCommand {
     List,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct WindowStatus {
     pub app_id: String,
     pub x: i32,
@@ -95,7 +95,7 @@ pub struct WindowStatus {
     pub mapped: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum EmbedResponse {
     Ok {
@@ -251,7 +251,7 @@ pub fn send_command(cmd: &EmbedCommand) -> Result<EmbedResponse, String> {
     let mut stream =
         UnixStream::connect(&path).map_err(|e| format!("connect to {}: {e}", path.display()))?;
 
-    let mut json = serde_json::to_string(cmd).map_err(|e| e.to_string())?;
+    let mut json: _ = serde_json::to_string(cmd).map_err(|e| e.to_string())?;
     json.push('\n');
     stream
         .write_all(json.as_bytes())

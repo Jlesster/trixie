@@ -38,19 +38,6 @@ pub fn vt_from_keysym(keysym: xkb::Keysym) -> Option<u32> {
     (raw >= VT_FIRST && raw <= VT_LAST).then(|| raw - VT_FIRST + 1)
 }
 
-// ── spawn helper ──────────────────────────────────────────────────────────────
-
-pub fn spawn_action(cmd: &str, args: &[String], wayland_socket: &str) {
-    let bin = config::expand_tilde(cmd);
-    if let Err(e) = std::process::Command::new(&bin)
-        .args(args)
-        .env("WAYLAND_DISPLAY", wayland_socket)
-        .spawn()
-    {
-        tracing::warn!("Spawn failed ({bin}): {e}");
-    }
-}
-
 // ── main input handler ────────────────────────────────────────────────────────
 
 pub fn handle_input(state: &mut KittyCompositor, event: InputEvent<LibinputInputBackend>) {
@@ -75,6 +62,7 @@ fn handle_keyboard(
     let keycode = event.key_code();
     let key_state = event.state();
 
+    // Auto-focus the first window if nothing is focused yet.
     {
         let kbd = state.seat.get_keyboard().unwrap();
         if kbd.current_focus().is_none() {
@@ -83,8 +71,13 @@ fn handle_keyboard(
                 .elements()
                 .next()
                 .and_then(|w| w.wl_surface().map(|s| s.into_owned()));
+            drop(kbd);
             if let Some(s) = surface {
-                kbd.set_focus(state, Some(s), serial);
+                state
+                    .seat
+                    .get_keyboard()
+                    .unwrap()
+                    .set_focus(state, Some(s), serial);
             }
         }
     }
@@ -102,7 +95,7 @@ fn handle_keyboard(
                 return FilterResult::Forward;
             }
 
-            // ── VT switching ──────────────────────────────────────────────────
+            // ── VT switching (Ctrl+Alt+Fx / Ctrl+Alt+F1-F12) ─────────────────
             if mods.ctrl && mods.alt {
                 let base_sym = keysym_handle
                     .raw_syms()
@@ -127,17 +120,30 @@ fn handle_keyboard(
             let pressed_sym = keysym_handle.modified_sym();
             let name = config::normalise_key_name(&xkb::keysym_get_name(pressed_sym));
 
-            // ── mouse mode switching — checked before user keybinds ────────────
-            // Super+i → Insert (compositor handles pointer, glyph visible)
+            // ── mouse mode switching ──────────────────────────────────────────
+            //
+            // Super+i        → Insert (compositor owns pointer; glyph visible)
+            // Super+Escape   → Normal (passthrough; glyph hidden)
+            // Super+[        → Normal (alternative chord)
+            //
+            // Plain Escape is intentionally NOT intercepted here so that
+            // applications (vim, fzf, …) always receive it.
+
             if mods.logo && !mods.shift && !mods.ctrl && !mods.alt && name == "i" {
                 if state.mouse_mode != MouseMode::Insert {
                     tracing::info!("Mouse mode → Insert");
                     state.mouse_mode = MouseMode::Insert;
                     return FilterResult::Intercept(());
                 }
+                // Already in Insert — fall through so the key reaches the app.
             }
-            // Escape or Super+[ → Normal (passthrough, glyph hidden)
-            if name == "escape" || (mods.logo && name == "bracketleft") {
+
+            if mods.logo
+                && !mods.shift
+                && !mods.ctrl
+                && !mods.alt
+                && (name == "escape" || name == "bracketleft")
+            {
                 if state.mouse_mode != MouseMode::Normal {
                     tracing::info!("Mouse mode → Normal");
                     state.mouse_mode = MouseMode::Normal;
@@ -155,6 +161,9 @@ fn handle_keyboard(
             );
 
             // ── user keybinds ─────────────────────────────────────────────────
+            //
+            // NOTE: Super+Return is deliberately NOT bound here.  trixterm
+            // owns that key for TWM takeover.  The compositor forwards it.
             for i in 0..state.config.keybinds.len() {
                 if !config::mods_match(mods, &state.config.keybinds[i].mods) {
                     continue;
@@ -189,7 +198,7 @@ fn handle_keyboard(
                         crate::main_loop::reload_config(state);
                     }
                     KeyAction::Spawn { command, args } => {
-                        spawn_action(&command, &args, &wayland_socket);
+                        config::spawn_process(&command, &args, &wayland_socket);
                     }
                 }
                 return FilterResult::Intercept(());
@@ -215,11 +224,11 @@ fn handle_pointer_motion_abs(
     let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
     let serial = SCOUNTER.next_serial();
 
-    // Always update the internal pointer position so it's correct when
-    // switching back to Insert, but only send motion to clients in Normal mode.
+    // Always update the internal pointer position so it is correct when
+    // switching back to Insert, but only forward motion to clients in Normal.
     let under = match state.mouse_mode {
         MouseMode::Normal => surface_under(&state.space, pos),
-        MouseMode::Insert => None, // don't forward to surfaces in Insert
+        MouseMode::Insert => None,
     };
 
     let ptr = state.pointer.clone();
@@ -285,7 +294,7 @@ fn handle_pointer_button(
     let btn_state = wl_pointer::ButtonState::from(event.state());
 
     match state.mouse_mode {
-        // ── Normal: pass click straight through to the focused surface ────────
+        // Normal: pass click straight through to the focused surface.
         MouseMode::Normal => {
             let ptr = state.pointer.clone();
             ptr.button(
@@ -300,7 +309,7 @@ fn handle_pointer_button(
             ptr.frame(state);
         }
 
-        // ── Insert: focus/raise on press, stay in Insert, don't forward ───────
+        // Insert: focus/raise the clicked window but do not forward the click.
         MouseMode::Insert => {
             if btn_state == wl_pointer::ButtonState::Pressed {
                 let pos = state.pointer.current_location();
@@ -325,8 +334,6 @@ fn handle_pointer_button(
                         .unwrap()
                         .set_focus(state, Some(s), serial);
                 }
-                // Do not forward the click to the surface — Insert mode only
-                // manages focus, it doesn't pass pointer events through.
             }
         }
     }
@@ -338,8 +345,8 @@ fn handle_pointer_axis(
     state: &mut KittyCompositor,
     event: <LibinputInputBackend as smithay::backend::input::InputBackend>::PointerAxisEvent,
 ) {
-    // Scroll is forwarded in Normal mode (app owns the mouse), suppressed in
-    // Insert mode (compositor owns the mouse, no app to scroll).
+    // Scroll forwarded in Normal mode; suppressed in Insert (compositor owns
+    // the mouse — there is no app scroll target).
     if state.mouse_mode == MouseMode::Insert {
         return;
     }

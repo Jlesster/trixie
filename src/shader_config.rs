@@ -48,7 +48,7 @@ use std::{
     time::SystemTime,
 };
 
-use crate::config::expand_tilde;
+use crate::util::expand_tilde;
 
 // ── raw deserialization ───────────────────────────────────────────────────────
 

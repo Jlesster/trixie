@@ -1,40 +1,29 @@
-// embedded_window.rs — render embedded Wayland clients (Firefox etc.) directly
-// into the compositor framebuffer as textured quads, and expose a SharedFrame
-// for the TWM-side KGP encoder.
-//
-// Flow:
-//   1. TWM sends Spawn via embed IPC → compositor launches Firefox with
-//      WAYLAND_DISPLAY pointing at our socket.
-//   2. Firefox connects as a normal xdg_toplevel client.
-//   3. handlers.rs::new_toplevel calls EmbeddedManager::try_claim() — if
-//      the app_id matches a pending placement, the surface is "claimed" and
-//      removed from Space (so tiling logic never sees it).
-//   4. On every wl_surface.commit the buffer is imported into a GlesTexture,
-//      then read back into the SharedFrame for TWM-side KGP encoding.
-//   5. render_surface collects EmbeddedRenderElement instances and pushes them
-//      below normal Space elements.
-//   6. When the tile resizes, TWM sends Move → compositor calls
-//      EmbeddedManager::update_placement() + sends xdg configure.
-
 use std::collections::HashMap;
 
+use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
+use smithay::backend::renderer::Renderer;
 use smithay::{
     backend::renderer::{
         element::{Element, Id, Kind, RenderElement, UnderlyingStorage},
-        gles::{ffi as gl, GlesError, GlesFrame, GlesRenderer, GlesTexture},
+        gles::{
+            ffi, // GL constants: ffi::FRAMEBUFFER, ffi::RGBA, etc.
+            GlesError,
+            GlesFrame,
+            GlesRenderer,
+            GlesTexture,
+        },
         utils::{CommitCounter, DamageSet, OpaqueRegions},
-        ImportMemWl,
+        Texture,
     },
     reexports::wayland_server::protocol::wl_surface::WlSurface,
-    utils::{Buffer, Physical, Point, Rectangle, Scale, Size, Transform},
-    wayland::shell::xdg::ToplevelSurface,
+    utils::{Buffer, Physical, Rectangle, Scale, Transform},
+    wayland::{compositor::with_states, shell::xdg::ToplevelSurface},
 };
 
-use crate::embedded_surface::{FrameBuffer, SharedFrame};
+use crate::shared_frame_shm::ShmWriter;
 
 // ── Placement ─────────────────────────────────────────────────────────────────
 
-/// Pixel-space bounding rect for an embedded surface on the output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EmbeddedPlacement {
     pub x: i32,
@@ -49,8 +38,6 @@ impl EmbeddedPlacement {
     }
 }
 
-// ── Pending placement ─────────────────────────────────────────────────────────
-
 struct PendingPlacement {
     placement: EmbeddedPlacement,
 }
@@ -64,26 +51,22 @@ pub struct EmbeddedEntry {
     pub texture: Option<GlesTexture>,
     pub commit_counter: CommitCounter,
     pub mapped: bool,
+    pub shm_writer: Option<ShmWriter>,
 }
 
 // ── Manager ───────────────────────────────────────────────────────────────────
 
 #[derive(Default)]
 pub struct EmbeddedManager {
-    /// Live embedded surfaces, keyed by app_id.
     pub entries: HashMap<String, EmbeddedEntry>,
-    /// Placements reserved before the app has connected.
     pending: HashMap<String, PendingPlacement>,
-    /// CPU-side frame buffers shared with the TWM encoder, keyed by app_id.
-    /// The TWM holds a clone of each Arc; the compositor writes on commit.
-    pub shared_frames: HashMap<String, SharedFrame>,
 }
 
 impl EmbeddedManager {
-    // ── pending placement API ─────────────────────────────────────────────────
+    pub fn has_pending(&self, app_id: &str) -> bool {
+        self.pending.contains_key(app_id)
+    }
 
-    /// Reserve a placement for an app that will connect soon.
-    /// Called by handle_embed_command(Spawn) before launching the process.
     pub fn request_placement(&mut self, app_id: &str, placement: EmbeddedPlacement) {
         tracing::debug!(
             "EmbeddedManager: pending placement for '{}' @ {}x{}+{},{}",
@@ -97,11 +80,6 @@ impl EmbeddedManager {
             .insert(app_id.to_owned(), PendingPlacement { placement });
     }
 
-    // ── try_claim ─────────────────────────────────────────────────────────────
-
-    /// Called from handlers.rs::new_toplevel.
-    /// Returns true if this surface was claimed (caller must NOT map it into Space).
-    /// Also registers a SharedFrame so the TWM encoder can read pixels.
     pub fn try_claim(
         &mut self,
         app_id: &str,
@@ -112,16 +90,12 @@ impl EmbeddedManager {
             return false;
         };
 
-        tracing::info!(
-            "EmbeddedManager: claiming '{}' surface {:?}",
-            app_id,
-            surface.id(),
-        );
-
-        toplevel.with_pending_state(|s| {
-            s.size = Some(pending.placement.logical_size());
-        });
+        toplevel.with_pending_state(|s| s.size = Some(pending.placement.logical_size()));
         toplevel.send_configure();
+
+        let shm_writer = ShmWriter::create(app_id)
+            .map_err(|e| tracing::warn!("shm create '{}': {e}", app_id))
+            .ok();
 
         self.entries.insert(
             app_id.to_owned(),
@@ -132,123 +106,80 @@ impl EmbeddedManager {
                 texture: None,
                 commit_counter: CommitCounter::default(),
                 mapped: false,
+                shm_writer,
             },
         );
 
-        // Register a fresh SharedFrame for this surface.
-        self.shared_frames
-            .entry(app_id.to_owned())
-            .or_insert_with(SharedFrame::default);
-
+        tracing::info!("EmbeddedManager: claimed '{}'", app_id);
         true
     }
 
-    // ── commit handler ────────────────────────────────────────────────────────
+    // ── commit ────────────────────────────────────────────────────────────────
 
-    /// Import the committed buffer into a GL texture and read pixels back into
-    /// the SharedFrame so the TWM encoder can consume them.
-    ///
-    /// Call this for every wl_surface commit; non-embedded surfaces are ignored.
     pub fn on_commit(&mut self, renderer: &mut GlesRenderer, surface: &WlSurface) {
-        // Find which app_id this surface belongs to.
         let app_id = self
             .entries
             .iter()
             .find(|(_, e)| &e.surface == surface)
             .map(|(id, _)| id.clone());
-
         let Some(app_id) = app_id else { return };
 
-        // Import GL texture.
-        match renderer.import_surface(surface, None) {
-            Ok(tex) => {
-                let w = tex.width();
-                let h = tex.height();
+        let texture: Option<GlesTexture> = with_states(surface, |states| {
+            let data = states.data_map.get::<RendererSurfaceStateUserData>()?;
+            let guard = data.lock().ok()?;
+            let tex_ref = guard.texture::<GlesTexture>(renderer.context_id())?;
+            Some(tex_ref.clone())
+        });
 
-                // Readback pixels into SharedFrame before we move the texture.
-                if let Some(sf) = self.shared_frames.get(&app_id) {
-                    let mut pixels = vec![0u8; (w * h * 4) as usize];
-                    unsafe {
-                        readback_texture(tex.tex_id(), w, h, &mut pixels);
-                    }
-                    let mut guard = sf.lock().unwrap();
-                    let serial = guard.as_ref().map_or(1, |f| f.serial + 1);
-                    *guard = Some(FrameBuffer {
-                        pixels,
-                        width: w,
-                        height: h,
-                        serial,
-                    });
-                }
+        let Some(tex) = texture else {
+            tracing::debug!("EmbeddedManager: no texture yet for '{}'", app_id);
+            return;
+        };
 
-                if let Some(entry) = self.entries.get_mut(&app_id) {
-                    entry.texture = Some(tex);
-                    entry.commit_counter.increment();
-                    entry.mapped = true;
-                    tracing::trace!(
-                        "EmbeddedManager: imported texture for {:?} ({}x{})",
-                        surface.id(),
-                        w,
-                        h,
-                    );
-                }
+        let w = tex.width();
+        let h = tex.height();
+
+        if let Some(entry) = self.entries.get_mut(&app_id) {
+            if let Some(ref writer) = entry.shm_writer {
+                let mut pixels = vec![0u8; (w * h * 4) as usize];
+                // Use GlesRenderer::with_context to safely access the GL
+                // function table. This avoids any question of which crate
+                // owns the GL function pointers.
+                let _ = renderer.with_context(|gl| {
+                    unsafe { readback_texture(gl, tex.tex_id(), w, h, &mut pixels) };
+                });
+                writer.write_frame(&pixels, w, h);
             }
-            Err(e) => {
-                tracing::warn!("EmbeddedManager: import_surface failed: {e}");
-            }
+
+            entry.texture = Some(tex);
+            entry.commit_counter.increment();
+            entry.mapped = true;
+            tracing::trace!("EmbeddedManager: commit '{}' ({}x{})", app_id, w, h);
         }
     }
 
-    // ── resize / move ─────────────────────────────────────────────────────────
-
-    /// Update the on-screen placement and send an xdg configure to the client.
     pub fn update_placement(&mut self, app_id: &str, placement: EmbeddedPlacement) {
         if let Some(entry) = self.entries.get_mut(app_id) {
             entry.placement = placement;
-            entry.toplevel.with_pending_state(|s| {
-                s.size = Some(placement.logical_size());
-            });
+            entry
+                .toplevel
+                .with_pending_state(|s| s.size = Some(placement.logical_size()));
             if entry.toplevel.is_initial_configure_sent() {
                 entry.toplevel.send_pending_configure();
             }
-            tracing::debug!(
-                "EmbeddedManager: updated placement for '{}' → {}x{}+{},{}",
-                app_id,
-                placement.w,
-                placement.h,
-                placement.x,
-                placement.y,
-            );
         } else if let Some(p) = self.pending.get_mut(app_id) {
-            // App not yet connected — update the pending reservation.
             p.placement = placement;
         }
     }
 
-    // ── removal ───────────────────────────────────────────────────────────────
-
     pub fn remove(&mut self, app_id: &str) {
         self.entries.remove(app_id);
         self.pending.remove(app_id);
-        self.shared_frames.remove(app_id);
     }
 
-    // ── queries ───────────────────────────────────────────────────────────────
-
-    /// True if this wl_surface belongs to an embedded entry.
     pub fn is_embedded_surface(&self, surface: &WlSurface) -> bool {
         self.entries.values().any(|e| &e.surface == surface)
     }
-
-    /// Get the SharedFrame for a given app_id so the TWM can hold a clone.
-    /// Returns None if the surface hasn't been claimed yet; the TWM should
-    /// call this after receiving the Spawn ACK and retry on the next IPC poll
-    /// if it gets None (the app may not have connected yet).
-    pub fn shared_frame(&self, app_id: &str) -> Option<SharedFrame> {
-        self.shared_frames.get(app_id).cloned()
-    }
-
-    // ── window status snapshot (for IPC List response) ────────────────────────
 
     pub fn window_statuses(&self) -> Vec<crate::embedded_ipc::WindowStatus> {
         self.entries
@@ -264,10 +195,6 @@ impl EmbeddedManager {
             .collect()
     }
 
-    // ── render elements ───────────────────────────────────────────────────────
-
-    /// Collect one EmbeddedRenderElement per mapped embedded surface.
-    /// Push these before Space elements so they appear behind normal windows.
     pub fn render_elements(&self) -> Vec<EmbeddedRenderElement> {
         self.entries
             .values()
@@ -288,51 +215,59 @@ impl EmbeddedManager {
 }
 
 // ── GL texture readback ───────────────────────────────────────────────────────
+//
+// Called inside renderer.with_context(), which provides the `gl` function
+// table as a &ffi::Gles2. The ffi constants (FRAMEBUFFER, RGBA, etc.) come
+// from the same module.
+//
+// Reads rows bottom-to-top and writes them top-to-bottom to flip the
+// vertical axis from GL's bottom-left origin to KGP's top-left origin.
 
-/// Read pixels from a GL texture into `out` (RGBA, row-major) using a
-/// temporary FBO. Must be called on the GL thread with the correct EGL
-/// context current.
-///
-/// For high-frequency use (60 fps Firefox), prefer the zero-copy path:
-/// share the `GlesTexture` handle directly with the TWM renderer via an
-/// `Arc<Mutex<Option<GlesTexture>>>` and skip the CPU readback entirely.
-unsafe fn readback_texture(tex_id: u32, w: u32, h: u32, out: &mut Vec<u8>) {
+unsafe fn readback_texture(gl: &ffi::Gles2, tex_id: u32, w: u32, h: u32, out: &mut Vec<u8>) {
     out.resize((w * h * 4) as usize, 0);
 
     let mut fbo = 0u32;
-    gl::GenFramebuffers(1, &mut fbo);
-    gl::BindFramebuffer(gl::FRAMEBUFFER, fbo);
-    gl::FramebufferTexture2D(
-        gl::FRAMEBUFFER,
-        gl::COLOR_ATTACHMENT0,
-        gl::TEXTURE_2D,
+    gl.GenFramebuffers(1, &mut fbo);
+    gl.BindFramebuffer(ffi::FRAMEBUFFER, fbo);
+    gl.FramebufferTexture2D(
+        ffi::FRAMEBUFFER,
+        ffi::COLOR_ATTACHMENT0,
+        ffi::TEXTURE_2D,
         tex_id,
         0,
     );
 
-    let status = gl::CheckFramebufferStatus(gl::FRAMEBUFFER);
-    if status == gl::FRAMEBUFFER_COMPLETE {
-        gl::ReadPixels(
-            0,
-            0,
-            w as i32,
-            h as i32,
-            gl::RGBA,
-            gl::UNSIGNED_BYTE,
-            out.as_mut_ptr() as *mut _,
-        );
+    let status = gl.CheckFramebufferStatus(ffi::FRAMEBUFFER);
+    if status == ffi::FRAMEBUFFER_COMPLETE {
+        let row_bytes = (w * 4) as usize;
+        let mut row_buf = vec![0u8; row_bytes];
+
+        for y in 0..h {
+            gl.ReadPixels(
+                0,
+                y as i32,
+                w as i32,
+                1,
+                ffi::RGBA,
+                ffi::UNSIGNED_BYTE,
+                row_buf.as_mut_ptr() as *mut _,
+            );
+            // GL row 0 is the bottom row — place it at the end of `out`.
+            let dst_row = (h - 1 - y) as usize;
+            let dst = dst_row * row_bytes;
+            out[dst..dst + row_bytes].copy_from_slice(&row_buf);
+        }
     } else {
         tracing::warn!(
-            "EmbeddedManager: readback FBO incomplete (status=0x{:X}) for tex {}",
-            status,
+            "readback_texture: FBO incomplete for tex {} (status={:#x})",
             tex_id,
+            status
         );
-        // Zero the buffer so the TWM doesn't render garbage.
         out.fill(0);
     }
 
-    gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
-    gl::DeleteFramebuffers(1, &fbo);
+    gl.BindFramebuffer(ffi::FRAMEBUFFER, 0);
+    gl.DeleteFramebuffers(1, &fbo);
 }
 
 // ── Render element ────────────────────────────────────────────────────────────
@@ -348,7 +283,6 @@ impl Element for EmbeddedRenderElement {
     fn id(&self) -> &Id {
         &self.id
     }
-
     fn current_commit(&self) -> CommitCounter {
         self.commit_counter
     }
@@ -370,19 +304,18 @@ impl Element for EmbeddedRenderElement {
     fn damage_since(
         &self,
         scale: Scale<f64>,
-        _commit: Option<CommitCounter>,
+        _: Option<CommitCounter>,
     ) -> DamageSet<i32, Physical> {
         DamageSet::from_slice(&[self.geometry(scale)])
     }
 
-    fn opaque_regions(&self, _scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+    fn opaque_regions(&self, _: Scale<f64>) -> OpaqueRegions<i32, Physical> {
         OpaqueRegions::default()
     }
 
     fn alpha(&self) -> f32 {
         1.0
     }
-
     fn kind(&self) -> Kind {
         Kind::Unspecified
     }
@@ -391,30 +324,32 @@ impl Element for EmbeddedRenderElement {
 impl RenderElement<GlesRenderer> for EmbeddedRenderElement {
     fn draw(
         &self,
-        frame: &mut GlesFrame<'_>,
+        frame: &mut GlesFrame<'_, '_>,
         src: Rectangle<f64, Buffer>,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
         _opaque_regions: &[Rectangle<i32, Physical>],
     ) -> Result<(), GlesError> {
-        frame.render_texture_from_to(&self.texture, src, dst, damage, &[], Transform::Normal, 1.0)
+        frame.render_texture_from_to(
+            &self.texture,
+            src,
+            dst,
+            damage,
+            &[],
+            Transform::Normal,
+            1.0,
+            None,
+            &[],
+        )
     }
 
-    fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
+    fn underlying_storage(&self, _: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
         None
     }
 }
 
-// ── Config entry (for general.json) ──────────────────────────────────────────
+// ── Config entry ──────────────────────────────────────────────────────────────
 
-/// Declares an app that should be embedded rather than tiled/floating.
-///
-/// Add to general.json:
-/// ```json
-/// "embedded": [
-///   { "app_id": "firefox", "x": 0, "y": 0, "w": 1920, "h": 1080 }
-/// ]
-/// ```
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct EmbeddedConfig {
     pub app_id: String,

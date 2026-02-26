@@ -7,33 +7,28 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::config::{Config, FloatingMarker};
-use crate::embedded_ipc::{EmbedCommand, EmbedIpcServer, EmbedResponse, WindowStatus};
+use crate::config::Config;
+use crate::embedded_ipc::{EmbedCommand, EmbedIpcServer};
 use crate::embedded_window::{EmbeddedManager, EmbeddedPlacement, EmbeddedRenderElement};
-use crate::render::surface_under;
 use crate::shader_pass::ShaderPass;
 
 use smithay::{
+    backend::renderer::element::AsRenderElements,
     backend::{
         allocator::gbm::{GbmAllocator, GbmDevice},
         drm::{
-            compositor::{DrmCompositor, FrameFlags},
-            exporter::gbm::GbmFramebufferExporter,
-            DrmDevice, DrmDeviceFd, DrmNode,
+            compositor::DrmCompositor, exporter::gbm::GbmFramebufferExporter, DrmDevice,
+            DrmDeviceFd, DrmNode,
         },
         renderer::{
             damage::OutputDamageTracker,
-            element::{solid::SolidColorRenderElement, surface::WaylandSurfaceRenderElement, Kind},
-            gles::GlesRenderer,
-            utils::on_commit_buffer_handler,
+            element::{solid::SolidColorRenderElement, surface::WaylandSurfaceRenderElement},
+            gles::{GlesRenderer, GlesTexture},
             ImportDma,
         },
         session::libseat::LibSeatSession,
     },
-    desktop::{
-        space::{space_render_elements, SpaceRenderElements},
-        PopupManager, Space, Window,
-    },
+    desktop::{PopupManager, Space, Window},
     input::{
         pointer::{CursorImageStatus, PointerHandle},
         Seat, SeatState,
@@ -43,16 +38,20 @@ use smithay::{
         calloop::LoopHandle,
         drm::control::crtc,
         input::Libinput,
-        wayland_server::{backend::ClientId, protocol::wl_surface::WlSurface, DisplayHandle},
+        wayland_server::{
+            backend::{ClientId, ObjectId},
+            protocol::wl_surface::WlSurface,
+            DisplayHandle,
+        },
     },
-    utils::{Clock, Logical, Monotonic, Physical, Rectangle, SERIAL_COUNTER as SCOUNTER},
+    utils::{Clock, Monotonic, SERIAL_COUNTER as SCOUNTER},
     wayland::{
         compositor::CompositorState,
         dmabuf::{DmabufGlobal, DmabufState},
         selection::{data_device::DataDeviceState, primary_selection::PrimarySelectionState},
         shell::{
             wlr_layer::WlrLayerShellState,
-            xdg::{decoration::XdgDecorationState, XdgShellState},
+            xdg::{decoration::XdgDecorationState, ToplevelSurface, XdgShellState},
         },
         shm::ShmState,
     },
@@ -67,7 +66,7 @@ pub type GbmDrmCompositor =
 
 smithay::backend::renderer::element::render_elements! {
     pub TrixieRenderElement<=GlesRenderer>;
-    Space    = SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
+    Space    = WaylandSurfaceRenderElement<GlesRenderer>,
     Cursor   = SolidColorRenderElement,
     Embedded = EmbeddedRenderElement,
 }
@@ -154,8 +153,13 @@ pub struct KittyCompositor {
     pub pointer: PointerHandle<Self>,
     pub cursor_status: CursorImageStatus,
     pub mouse_mode: MouseMode,
+
+    // ── embedded windows ──────────────────────────────────────────────────────
     pub embedded: EmbeddedManager,
     pub embed_ipc: EmbedIpcServer,
+    /// Toplevels whose app_id was not yet known at new_toplevel time.
+    /// Keyed by WlSurface ObjectId; retried on each commit.
+    pub unclaimed_toplevels: HashMap<ObjectId, ToplevelSurface>,
 
     pub session: LibSeatSession,
     pub backends: HashMap<DrmNode, BackendData>,
@@ -164,31 +168,123 @@ pub struct KittyCompositor {
     pub exec_once_done: bool,
     pub shader_pass: ShaderPass,
     pub start_time: Instant,
-
-    // ── embedded windows ──────────────────────────────────────────────────────
-    pub embedded: EmbeddedManager,
-    pub embed_ipc: EmbedIpcServer,
 }
 
 // ── render ────────────────────────────────────────────────────────────────────
 
 impl KittyCompositor {
+    pub fn render_all(&mut self) {
+        let nodes: Vec<DrmNode> = self.backends.keys().copied().collect();
+        for node in nodes {
+            let crtcs: Vec<crtc::Handle> = self.backends[&node].surfaces.keys().copied().collect();
+            for crtc in crtcs {
+                self.render_surface(node, crtc);
+            }
+        }
+    }
+
+    pub fn render_surface(&mut self, node: DrmNode, crtc: crtc::Handle) {
+        let now = Instant::now();
+
+        let backend = match self.backends.get_mut(&node) {
+            Some(b) => b,
+            None => return,
+        };
+        let surface = match backend.surfaces.get_mut(&crtc) {
+            Some(s) => s,
+            None => return,
+        };
+
+        if surface.pending_frame || now < surface.next_frame_time {
+            return;
+        }
+
+        let output = surface.output.clone();
+        let scale = smithay::utils::Scale::from(output.current_scale().fractional_scale());
+        let clear: [f32; 4] = {
+            let c = self.config.background_color;
+            [c[0], c[1], c[2], 1.0]
+        };
+
+        // ── 1. Embedded quads ─────────────────────────────────────────────────
+        let embedded_elements: Vec<TrixieRenderElement> = self
+            .embedded
+            .render_elements()
+            .into_iter()
+            .map(TrixieRenderElement::Embedded)
+            .collect();
+
+        // ── 2. Space elements ─────────────────────────────────────────────────
+        // space_render_elements returns a single SpaceRenderElements value,
+        // not a Vec — collect via AsRenderElements on each window instead.
+        let space_elements: Vec<TrixieRenderElement> = self
+            .space
+            .elements()
+            .flat_map(|w| {
+                let loc = self.space.element_location(w).unwrap_or_default();
+                w.render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
+                    &mut backend.renderer,
+                    loc.to_physical_precise_round(scale),
+                    scale,
+                    1.0,
+                )
+            })
+            .map(TrixieRenderElement::Space)
+            .collect();
+
+        // ── 3. Merge ──────────────────────────────────────────────────────────
+        let mut all: Vec<TrixieRenderElement> = embedded_elements;
+        all.extend(space_elements);
+
+        // ── 4. Render frame ───────────────────────────────────────────────────
+        let render_result = surface.compositor.render_frame::<_, TrixieRenderElement>(
+            &mut backend.renderer,
+            &all,
+            clear,
+            smithay::backend::drm::compositor::FrameFlags::empty(),
+        );
+
+        match render_result {
+            Ok(frame) => {
+                if !frame.is_empty {
+                    match surface.compositor.queue_frame(()) {
+                        Ok(()) => {
+                            surface.pending_frame = true;
+                        }
+                        Err(e) => tracing::warn!("queue_frame({node},{crtc:?}): {e}"),
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("render_frame({node},{crtc:?}): {e}"),
+        }
+
+        surface.next_frame_time = now + surface.frame_duration;
+    }
+
+    pub fn frame_finish(&mut self, node: DrmNode, crtc: crtc::Handle) {
+        if let Some(b) = self.backends.get_mut(&node) {
+            if let Some(s) = b.surfaces.get_mut(&crtc) {
+                s.pending_frame = false;
+                if let Err(e) = s.compositor.frame_submitted() {
+                    tracing::warn!("frame_submitted({node},{crtc:?}): {e}");
+                }
+            }
+        }
+    }
+
+    // ── IPC ───────────────────────────────────────────────────────────────────
+
     pub fn process_embed_ipc(&mut self) {
         let cmds = self.embed_ipc.drain();
         for cmd in cmds {
             self.handle_embed_command(cmd);
         }
-        // Keep the IPC window list in sync after every batch.
         let statuses = self.embedded.window_statuses();
         self.embed_ipc.update_windows(statuses);
     }
 
-    fn handle_embed_command(&mut self, cmd: crate::embedded_ipc::EmbedCommand) {
-        use crate::embedded_ipc::EmbedCommand;
-        use crate::embedded_window::EmbeddedPlacement;
-
+    fn handle_embed_command(&mut self, cmd: EmbedCommand) {
         match cmd {
-            // ── Spawn ─────────────────────────────────────────────────────────
             EmbedCommand::Spawn {
                 app_id,
                 args,
@@ -197,30 +293,28 @@ impl KittyCompositor {
                 w,
                 h,
             } => {
-                let p = EmbeddedPlacement { x, y, w, h };
-                self.embedded.request_placement(&app_id, p);
+                self.embedded
+                    .request_placement(&app_id, EmbeddedPlacement { x, y, w, h });
 
                 let socket = self.wayland_socket.clone();
-                tracing::info!("Spawning embedded app '{}' on {socket}", app_id);
-                let mut child = std::process::Command::new(&app_id);
-                child
+                tracing::info!("Spawning embedded '{}' on {socket}", app_id);
+                if let Err(e) = std::process::Command::new(&app_id)
                     .args(&args)
                     .env("WAYLAND_DISPLAY", &socket)
                     .env("MOZ_ENABLE_WAYLAND", "1")
                     .env("GDK_BACKEND", "wayland")
-                    .env("QT_QPA_PLATFORM", "wayland");
-                if let Err(e) = child.spawn() {
+                    .env("QT_QPA_PLATFORM", "wayland")
+                    .spawn()
+                {
                     tracing::warn!("Failed to spawn '{}': {e}", app_id);
                 }
             }
 
-            // ── Move / resize ─────────────────────────────────────────────────
             EmbedCommand::Move { app_id, x, y, w, h } => {
-                let p = EmbeddedPlacement { x, y, w, h };
-                self.embedded.update_placement(&app_id, p);
+                self.embedded
+                    .update_placement(&app_id, EmbeddedPlacement { x, y, w, h });
             }
 
-            // ── Focus ─────────────────────────────────────────────────────────
             EmbedCommand::Focus { app_id } => {
                 let surface = self
                     .embedded
@@ -228,30 +322,23 @@ impl KittyCompositor {
                     .get(&app_id)
                     .map(|e| e.surface.clone());
                 if let Some(s) = surface {
-                    let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+                    let serial = SCOUNTER.next_serial();
                     if let Some(kbd) = self.seat.get_keyboard() {
                         kbd.set_focus(self, Some(s), serial);
                     }
                 } else {
-                    tracing::warn!("Focus: embedded app '{}' not found", app_id);
+                    tracing::warn!("Focus: '{}' not found", app_id);
                 }
             }
 
-            // ── Close ─────────────────────────────────────────────────────────
             EmbedCommand::Close { app_id } => {
-                // Send xdg_toplevel.close — the destroy event will clean up
-                // the EmbeddedEntry via toplevel_destroyed in handlers.rs.
                 if let Some(entry) = self.embedded.entries.get(&app_id) {
                     entry.toplevel.send_close();
                 } else {
-                    // App may not have connected yet — just remove the reservation.
                     self.embedded.remove(&app_id);
-                    tracing::debug!("Close: removed pending reservation for '{}'", app_id);
                 }
             }
 
-            // ── List ──────────────────────────────────────────────────────────
-            // Handled inline by EmbedIpcServer::drain() — never reaches here.
             EmbedCommand::List => {}
         }
     }

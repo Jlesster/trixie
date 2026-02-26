@@ -10,7 +10,9 @@ mod render;
 mod shader_config;
 mod shader_ipc;
 mod shader_pass;
+mod shared_frame_shm;
 mod state;
+mod util;
 
 // expose reload_config to input.rs via crate::main_loop
 pub mod main_loop {
@@ -23,12 +25,13 @@ use state::{ClientState, KittyCompositor, MouseMode};
 
 use notify::{EventKind, RecursiveMode, Watcher};
 use std::{
+    collections::HashMap,
     process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc,
     },
-    time::Duration,
+  
 };
 
 use smithay::{
@@ -65,6 +68,9 @@ use smithay::{
 use smithay::backend::drm::NodeType;
 use smithay::desktop::{PopupManager, Space};
 use smithay::input::pointer::CursorImageStatus;
+
+use crate::embedded_ipc::EmbedIpcServer;
+use crate::embedded_window::EmbeddedManager;
 
 // ── config reload ─────────────────────────────────────────────────────────────
 
@@ -134,7 +140,7 @@ fn run_exec_once(state: &mut KittyCompositor) {
 }
 
 fn spawn_exec_entry(entry: &ExecEntry, wayland_socket: &str) {
-    let bin = config::expand_tilde(&entry.command);
+    let bin = util::expand_tilde(&entry.command);
     tracing::info!("exec: {bin} {:?}", entry.args);
     if let Err(e) = Command::new(&bin)
         .args(&entry.args)
@@ -308,6 +314,9 @@ fn main() {
         exec_once_done: false,
         shader_pass: ShaderPass::new(start_time),
         start_time,
+        embedded: EmbeddedManager::default(),
+        embed_ipc: EmbedIpcServer::bind(),
+        unclaimed_toplevels: HashMap::new(),
     };
 
     // ── udev ──────────────────────────────────────────────────────────────────
@@ -448,7 +457,7 @@ fn main() {
             let affects_config = ev.paths.iter().any(|p| {
                 matches!(
                     p.extension().and_then(|e| e.to_str()),
-                    Some("json") | Some("glsl")
+                    Some("conf") | Some("glsl")
                 )
             });
             if is_write && affects_config {
@@ -459,7 +468,6 @@ fn main() {
     .expect("Failed to create config file watcher");
 
     if config_dir.exists() {
-        // Recursive so changes to shaders/*.glsl are also caught.
         if let Err(e) = watcher.watch(&config_dir, RecursiveMode::Recursive) {
             tracing::warn!("Could not watch config dir {}: {e}", config_dir.display());
         } else {
@@ -471,6 +479,9 @@ fn main() {
     let mut dh = state.display_handle.clone();
     while running.load(Ordering::SeqCst) {
         let _ = event_loop.dispatch(Some(Duration::from_millis(1)), &mut state);
+
+        // Process any pending IPC commands from trixterm.
+        state.process_embed_ipc();
 
         if reload_rx.try_recv().is_ok() {
             while reload_rx.try_recv().is_ok() {}
