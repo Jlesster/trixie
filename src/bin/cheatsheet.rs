@@ -529,6 +529,11 @@ fn render_footer(f: &mut Frame, area: Rect) {
 // ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() -> io::Result<()> {
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(std::io::stderr)
+        .init();
+
     let config = Config::load();
     let comp_entries = build_compositor_entries(&config);
     let kitty_entries = build_kitty_entries();

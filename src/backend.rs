@@ -31,6 +31,10 @@ use smithay::{
 
 use crate::state::{BackendData, KittyCompositor, SurfaceData};
 
+// Load the gl crate's function pointer table.
+// Called once per EGL context creation in add_gpu().
+use gl;
+
 pub fn add_gpu(
     state: &mut KittyCompositor,
     dh: &DisplayHandle,
@@ -51,6 +55,40 @@ pub fn add_gpu(
 
     if let Err(e) = egl.bind_wl_display(dh) {
         tracing::warn!("EGL bind_wl_display failed (hw-accel unavailable): {e}");
+    }
+
+    // ── Load GL function pointers ─────────────────────────────────────────
+    // The `gl` crate requires explicit loading after the EGL context is
+    // current. GlesRenderer::new() makes it current, so we load here.
+    // Safe to call multiple times — just overwrites pointers with same values.
+    gl::load_with(|s| {
+        let sym = std::ffi::CString::new(s).unwrap();
+        unsafe { smithay::backend::egl::ffi::egl::GetProcAddress(sym.as_ptr()) as *const _ }
+    });
+
+    // ── PixelUI init ──────────────────────────────────────────────────────
+    // Must happen while this EGL context is current (i.e. right here).
+    // The guard prevents double-init on multi-GPU systems — cell_size()
+    // returns the default (8,16) until install_renderer() is called.
+    if crate::pixelui::overlay_element::cell_size() == (8, 16) {
+        tracing::info!(
+            "init_pixel_ui: starting, font path = {:?}",
+            state.config.font.path
+        );
+
+        // Explicitly make the EGL context current before any raw GL calls.
+        // GlesRenderer::new() leaves the context current, but Smithay may
+        // unbind it internally after construction. Force it current here.
+        if let Err(e) = unsafe { renderer.egl_context().make_current() } {
+            tracing::warn!("init_pixel_ui: could not make EGL context current: {e}");
+        } else {
+            init_pixel_ui(state);
+        }
+
+        tracing::info!(
+            "init_pixel_ui: returned, installed={}",
+            crate::pixelui::overlay_element::is_installed()
+        );
     }
 
     state
@@ -109,6 +147,92 @@ pub fn add_gpu(
     Ok(())
 }
 
+// ── PixelUI / UiRenderer initialisation ──────────────────────────────────────
+
+fn init_pixel_ui(state: &KittyCompositor) {
+    tracing::info!("init_pixel_ui entered");
+    use crate::font::GlyphAtlas;
+    use crate::pixelui::overlay_element;
+    use crate::pixelui::UiRenderer;
+    use crate::shaper::Shaper;
+
+    let font_cfg = &state.config.font;
+    tracing::info!("Reading font from {:?}", font_cfg.path);
+
+    let regular_bytes: &'static [u8] = match std::fs::read(&font_cfg.path) {
+        Ok(b) => Box::leak(b.into_boxed_slice()),
+        Err(e) => {
+            tracing::warn!(
+                "PixelUI: could not read font {:?}: {e} — TWM chrome disabled",
+                font_cfg.path
+            );
+            return;
+        }
+    };
+
+    let bold_bytes: Option<&'static [u8]> =
+        font_cfg
+            .bold_path
+            .as_ref()
+            .and_then(|p| match std::fs::read(p) {
+                Ok(b) => Some(Box::leak(b.into_boxed_slice()) as &'static [u8]),
+                Err(e) => {
+                    tracing::warn!("PixelUI: could not read bold font {p:?}: {e}");
+                    None
+                }
+            });
+
+    let italic_bytes: Option<&'static [u8]> =
+        font_cfg
+            .italic_path
+            .as_ref()
+            .and_then(|p| match std::fs::read(p) {
+                Ok(b) => Some(Box::leak(b.into_boxed_slice()) as &'static [u8]),
+                Err(e) => {
+                    tracing::warn!("PixelUI: could not read italic font {p:?}: {e}");
+                    None
+                }
+            });
+
+    let atlas = match GlyphAtlas::new(
+        regular_bytes,
+        bold_bytes,
+        italic_bytes,
+        font_cfg.size,
+        font_cfg.line_spacing.unwrap_or(1.1),
+        font_cfg.dpi.unwrap_or(96),
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!("PixelUI: GlyphAtlas::new failed: {e} — TWM chrome disabled");
+            return;
+        }
+    };
+    tracing::info!("GlyphAtlas created ok");
+    let shaper = Shaper::new(regular_bytes);
+    tracing::info!("Shaper created ok");
+
+    let current = unsafe { smithay::backend::egl::ffi::egl::GetCurrentContext() };
+    tracing::info!("EGL current context before UiRenderer::new: {:?}", current);
+
+    let ui_renderer = match UiRenderer::new(atlas, shaper, 0, 0) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("PixelUI: UiRenderer::new failed: {e} — TWM chrome disabled");
+            return;
+        }
+    };
+
+    overlay_element::install_renderer(ui_renderer);
+    tracing::info!(
+        "PixelUI installed — cell {}×{}px",
+        overlay_element::cell_size().0,
+        overlay_element::cell_size().1,
+    );
+}
+
+// ── add_output ────────────────────────────────────────────────────────────────
+
 pub fn add_output(
     state: &mut KittyCompositor,
     dh: &DisplayHandle,
@@ -144,6 +268,12 @@ pub fn add_output(
     );
     output.set_preferred(wl_mode);
     state.space.map_output(&output, (0, 0));
+
+    // Now we know the real pixel size — update the overlay viewport so NDC
+    // projection is correct for this output.
+    let ow = drm_mode.size().0 as u32;
+    let oh = drm_mode.size().1 as u32;
+    crate::pixelui::overlay_element::set_viewport(ow, oh);
 
     let compositor = DrmCompositor::new(
         &output,

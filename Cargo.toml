@@ -33,6 +33,8 @@ ratatui = "0.26"
 crossterm = "0.27"
 libc = "0.2.182"
 gl = "0.14.0"
+rustybuzz = "0.20.1"
+ab_glyph = "0.2.32"
 
 [[bin]]
 name = "cheatsheet"

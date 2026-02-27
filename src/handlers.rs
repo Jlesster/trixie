@@ -46,6 +46,7 @@ use smithay::{
     },
 };
 
+use ratatui::layout::Margin;
 use smithay::backend::renderer::{utils::on_commit_buffer_handler, ImportDma};
 use smithay::input::pointer::CursorImageStatus;
 
@@ -107,9 +108,6 @@ impl CompositorHandler for KittyCompositor {
         on_commit_buffer_handler::<Self>(surface);
 
         // ── Retry deferred app_id claim ───────────────────────────────────────
-        // Many apps (including Firefox) only set their app_id after the first
-        // commit. new_toplevel parks them in unclaimed_toplevels and we retry
-        // the claim here once the id is readable from XdgToplevelSurfaceData.
         let obj_id = surface.id();
         if self.unclaimed_toplevels.contains_key(&obj_id) {
             let app_id = with_states(surface, |states| {
@@ -125,15 +123,11 @@ impl CompositorHandler for KittyCompositor {
 
             if !app_id.is_empty() {
                 if self.embedded.has_pending(&app_id) {
-                    // Unmap the temporary Space entry created in new_toplevel.
-                    // We need to find the window first, then drop the borrow on
-                    // self.space before we can call try_claim.
                     let window_to_unmap = self
                         .space
                         .elements()
                         .find(|w| w.wl_surface().as_deref() == Some(surface))
                         .cloned();
-
                     if let Some(window) = window_to_unmap {
                         self.space.unmap_elem(&window);
                     }
@@ -142,12 +136,14 @@ impl CompositorHandler for KittyCompositor {
                     let wl = toplevel.wl_surface().clone();
                     if self.embedded.try_claim(&app_id, wl, toplevel) {
                         tracing::info!("commit: deferred claim succeeded for '{}'", app_id);
+                        // TWM: upgrade the pane content from Shell → Embedded
+                        if let Some(twm) = &mut self.twm {
+                            twm.assign_embedded(&app_id);
+                        }
                         let statuses = self.embedded.window_statuses();
                         self.embed_ipc.update_windows(statuses);
-                        // Fall through to the embedded commit path below.
                     }
                 } else {
-                    // Not an embedded app — promote to normal, stop retrying.
                     self.unclaimed_toplevels.remove(&obj_id);
                 }
             }
@@ -276,26 +272,37 @@ impl XdgShellHandler for KittyCompositor {
 
         let wl = surface.wl_surface().clone();
 
-        // Fast path: app_id known and we have a pending reservation.
+        // ── Fast path: known embedded client ─────────────────────────────────
         if !app_id.is_empty() && self.embedded.has_pending(&app_id) {
             if self.embedded.try_claim(&app_id, wl, surface.clone()) {
                 tracing::info!("new_toplevel: immediately claimed '{}'", app_id);
+                // TWM: the pane may have been pre-seeded as Shell; upgrade it.
+                if let Some(twm) = &mut self.twm {
+                    twm.assign_embedded(&app_id);
+                }
                 let statuses = self.embedded.window_statuses();
                 self.embed_ipc.update_windows(statuses);
                 return;
             }
         }
 
-        // Slow path: park for retry on first commit when app_id is available.
+        // ── Slow path: park for retry on commit ───────────────────────────────
+        // We don't know yet whether this is embedded or a normal toplevel.
+        // Register it as Shell in TWM for now; commit() will upgrade to
+        // Embedded if it turns out to be a managed embedded client.
+        if !app_id.is_empty() {
+            if let Some(twm) = &mut self.twm {
+                twm.open_shell_pane(&app_id);
+            }
+        }
+
         let obj_id = surface.wl_surface().id();
         self.unclaimed_toplevels.insert(obj_id, surface.clone());
 
         let window = Window::new_wayland_window(surface);
 
-        // FIX 3: send a configure with the real output size before mapping,
-        // so the client (trixterm, etc.) knows its initial dimensions.
-        // Without this the compositor sends Configure{0,0} and many terminals
-        // render nothing or pick an arbitrary fallback size.
+        // Send an initial configure with the output size so the client knows
+        // its dimensions before we hear back from it.
         let output_size = self
             .space
             .outputs()
@@ -304,35 +311,54 @@ impl XdgShellHandler for KittyCompositor {
             .map(|g| g.size)
             .unwrap_or_else(|| smithay::utils::Size::from((1920, 1080)));
 
+        // If TWM knows where this pane goes, use that size instead.
+        let twm_size: Option<smithay::utils::Size<i32, smithay::utils::Logical>> =
+            if !app_id.is_empty() {
+                self.twm.as_ref().and_then(|twm| {
+                    let (cw, ch) = crate::pixelui::overlay_element::cell_size();
+                    if cw == 0 || ch == 0 {
+                        return None;
+                    }
+                    twm.embedded_cell_rect(&app_id).map(|r| {
+                        let inner = r.inner(&Margin {
+                            horizontal: 1,
+                            vertical: 1,
+                        });
+                        smithay::utils::Size::from((
+                            (inner.width as i32 * cw as i32).max(80),
+                            (inner.height as i32 * ch as i32).max(24),
+                        ))
+                    })
+                })
+            } else {
+                None
+            };
+
         if let Some(toplevel) = window.toplevel() {
             toplevel.with_pending_state(|s| {
-                s.size = Some(output_size);
+                s.size = Some(twm_size.unwrap_or(output_size));
             });
             toplevel.send_configure();
         }
 
         self.space.map_element(window.clone(), (0, 0), false);
 
-        // FIX 5: give the new window keyboard focus immediately on map.
-        // Without this, trixterm receives no input until the user clicks.
-        // The input.rs fix moved focus recovery outside the closure, but focus
-        // is still never *set* proactively when a window first appears.
+        // Give the new window keyboard focus immediately.
         let wl_surface = window.wl_surface().map(|s| s.into_owned());
-
-        if let Some(surface) = wl_surface {
+        if let Some(s) = wl_surface {
             let serial = SCOUNTER.next_serial();
             if let Some(kbd) = self.seat.get_keyboard() {
-                kbd.set_focus(self, Some(surface), serial);
+                kbd.set_focus(self, Some(s), serial);
             }
         }
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
-        // Always clean up the staging map.
         let obj_id = surface.wl_surface().id();
         self.unclaimed_toplevels.remove(&obj_id);
 
         let wl = surface.wl_surface();
+
         if self.embedded.is_embedded_surface(wl) {
             let app_id = self
                 .embedded
@@ -343,13 +369,31 @@ impl XdgShellHandler for KittyCompositor {
             if let Some(id) = app_id {
                 tracing::info!("Embedded surface '{}' destroyed", id);
                 self.embedded.remove(&id);
+                if let Some(twm) = &mut self.twm {
+                    twm.close_pane_by_app_id(&id);
+                }
                 let statuses = self.embedded.window_statuses();
                 self.embed_ipc.update_windows(statuses);
             }
             return;
         }
 
-        // Normal tiled window destroyed.
+        // Normal toplevel destroyed — also clean up TWM pane.
+        let app_id = with_states(wl, |states| {
+            states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()
+                .and_then(|d| d.lock().ok())
+                .and_then(|l| l.app_id.clone())
+        })
+        .unwrap_or_default();
+
+        if !app_id.is_empty() {
+            if let Some(twm) = &mut self.twm {
+                twm.close_pane_by_app_id(&app_id);
+            }
+        }
+
         if self.space.elements().count() == 0 {
             let (bin, args) = self.config.terminal_cmd();
             tracing::info!("Terminal closed — relaunching {bin}");

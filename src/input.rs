@@ -27,6 +27,7 @@ use crate::{
     config::{self, KeyAction},
     render::surface_under,
     state::{KittyCompositor, MouseMode},
+    twm_drop_in::Action as TwmAction,
 };
 
 // ── vt keysym helper ──────────────────────────────────────────────────────────
@@ -36,6 +37,18 @@ pub fn vt_from_keysym(keysym: xkb::Keysym) -> Option<u32> {
     const VT_LAST: u32 = 0x1008FE0C;
     let raw = keysym.raw();
     (raw >= VT_FIRST && raw <= VT_LAST).then(|| raw - VT_FIRST + 1)
+}
+
+// ── TWM action dispatch ───────────────────────────────────────────────────────
+
+/// Central point for all TWM keybind effects.
+/// Dispatches to TwmState, then syncs focus + placement + triggers a redraw.
+fn run_twm_action(state: &mut KittyCompositor, action: TwmAction) {
+    if let Some(twm) = &mut state.twm {
+        twm.dispatch(&action);
+    }
+    state.sync_twm_focus_to_wayland();
+    state.render_all();
 }
 
 // ── main input handler ────────────────────────────────────────────────────────
@@ -95,7 +108,7 @@ fn handle_keyboard(
                 return FilterResult::Forward;
             }
 
-            // ── VT switching (Ctrl+Alt+Fx / Ctrl+Alt+F1-F12) ─────────────────
+            // ── VT switching ──────────────────────────────────────────────────
             if mods.ctrl && mods.alt {
                 let base_sym = keysym_handle
                     .raw_syms()
@@ -121,23 +134,13 @@ fn handle_keyboard(
             let name = config::normalise_key_name(&xkb::keysym_get_name(pressed_sym));
 
             // ── mouse mode switching ──────────────────────────────────────────
-            //
-            // Super+i        → Insert (compositor owns pointer; glyph visible)
-            // Super+Escape   → Normal (passthrough; glyph hidden)
-            // Super+[        → Normal (alternative chord)
-            //
-            // Plain Escape is intentionally NOT intercepted here so that
-            // applications (vim, fzf, …) always receive it.
-
             if mods.logo && !mods.shift && !mods.ctrl && !mods.alt && name == "i" {
                 if state.mouse_mode != MouseMode::Insert {
                     tracing::info!("Mouse mode → Insert");
                     state.mouse_mode = MouseMode::Insert;
                     return FilterResult::Intercept(());
                 }
-                // Already in Insert — fall through so the key reaches the app.
             }
-
             if mods.logo
                 && !mods.shift
                 && !mods.ctrl
@@ -160,10 +163,69 @@ fn handle_keyboard(
                 mods.alt,
             );
 
-            // ── user keybinds ─────────────────────────────────────────────────
+            // ── Hard-coded TWM keybinds (Super + hjkl / arrows / etc.) ────────
             //
-            // NOTE: Super+Return is deliberately NOT bound here.  trixterm
-            // owns that key for TWM takeover.  The compositor forwards it.
+            // These are intercepted before the config keybind table so they
+            // always work even if the user hasn't added them to trixie.conf.
+            // You can comment out any you want to expose via config instead.
+            if mods.logo && !mods.ctrl && !mods.alt {
+                // Focus movement — Super+hjkl and Super+arrows
+                let twm_action: Option<TwmAction> = if !mods.shift {
+                    match name.as_str() {
+                        "h" | "left" => Some(TwmAction::FocusLeft),
+                        "l" | "right" => Some(TwmAction::FocusRight),
+                        "k" | "up" => Some(TwmAction::FocusUp),
+                        "j" | "down" => Some(TwmAction::FocusDown),
+                        // Pane close
+                        "q" => Some(TwmAction::Close),
+                        // Cycle layout
+                        "space" => Some(TwmAction::NextLayout),
+                        // Bar toggle
+                        "b" => Some(TwmAction::ToggleBar),
+                        // Fullscreen
+                        "f" => Some(TwmAction::Fullscreen),
+                        // Main ratio
+                        "equal" => Some(TwmAction::GrowMain),
+                        "minus" => Some(TwmAction::ShrinkMain),
+                        // Workspace by number (Super+1..9)
+                        "1" => Some(TwmAction::Workspace(1)),
+                        "2" => Some(TwmAction::Workspace(2)),
+                        "3" => Some(TwmAction::Workspace(3)),
+                        "4" => Some(TwmAction::Workspace(4)),
+                        "5" => Some(TwmAction::Workspace(5)),
+                        "6" => Some(TwmAction::Workspace(6)),
+                        "7" => Some(TwmAction::Workspace(7)),
+                        "8" => Some(TwmAction::Workspace(8)),
+                        "9" => Some(TwmAction::Workspace(9)),
+                        _ => None,
+                    }
+                } else {
+                    // Super+Shift combos
+                    match name.as_str() {
+                        // Move pane within workspace
+                        "h" | "left" => Some(TwmAction::MoveLeft),
+                        "l" | "right" => Some(TwmAction::MoveRight),
+                        // Move to workspace (Super+Shift+1..9)
+                        "1" => Some(TwmAction::MoveToWorkspace(1)),
+                        "2" => Some(TwmAction::MoveToWorkspace(2)),
+                        "3" => Some(TwmAction::MoveToWorkspace(3)),
+                        "4" => Some(TwmAction::MoveToWorkspace(4)),
+                        "5" => Some(TwmAction::MoveToWorkspace(5)),
+                        "6" => Some(TwmAction::MoveToWorkspace(6)),
+                        "7" => Some(TwmAction::MoveToWorkspace(7)),
+                        "8" => Some(TwmAction::MoveToWorkspace(8)),
+                        "9" => Some(TwmAction::MoveToWorkspace(9)),
+                        _ => None,
+                    }
+                };
+
+                if let Some(action) = twm_action {
+                    run_twm_action(state, action);
+                    return FilterResult::Intercept(());
+                }
+            }
+
+            // ── Config-file keybinds ──────────────────────────────────────────
             for i in 0..state.config.keybinds.len() {
                 if !config::mods_match(mods, &state.config.keybinds[i].mods, &state.config.keyboard)
                 {
@@ -179,19 +241,27 @@ fn handle_keyboard(
                         state.running.store(false, Ordering::SeqCst);
                     }
                     KeyAction::CloseWindow => {
-                        let focus = state.seat.get_keyboard().and_then(|k| k.current_focus());
-                        let target = focus
-                            .and_then(|fs| {
-                                state
-                                    .space
-                                    .elements()
-                                    .find(|w| w.wl_surface().as_deref() == Some(&fs))
-                                    .cloned()
-                            })
-                            .or_else(|| state.space.elements().next().cloned());
-                        if let Some(w) = target {
-                            if let Some(t) = w.toplevel() {
-                                t.send_close();
+                        // Close via TWM first; fall back to killing the focused
+                        // space window if TWM has no pane for it.
+                        let had_twm_pane =
+                            state.twm.as_ref().and_then(|t| t.focused_id()).is_some();
+                        if had_twm_pane {
+                            run_twm_action(state, TwmAction::Close);
+                        } else {
+                            let focus = state.seat.get_keyboard().and_then(|k| k.current_focus());
+                            let target = focus
+                                .and_then(|fs| {
+                                    state
+                                        .space
+                                        .elements()
+                                        .find(|w| w.wl_surface().as_deref() == Some(&fs))
+                                        .cloned()
+                                })
+                                .or_else(|| state.space.elements().next().cloned());
+                            if let Some(w) = target {
+                                if let Some(t) = w.toplevel() {
+                                    t.send_close();
+                                }
                             }
                         }
                     }
@@ -225,8 +295,6 @@ fn handle_pointer_motion_abs(
     let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
     let serial = SCOUNTER.next_serial();
 
-    // Always update the internal pointer position so it is correct when
-    // switching back to Insert, but only forward motion to clients in Normal.
     let under = match state.mouse_mode {
         MouseMode::Normal => surface_under(&state.space, pos),
         MouseMode::Insert => None,
@@ -295,7 +363,6 @@ fn handle_pointer_button(
     let btn_state = wl_pointer::ButtonState::from(event.state());
 
     match state.mouse_mode {
-        // Normal: pass click straight through to the focused surface.
         MouseMode::Normal => {
             let ptr = state.pointer.clone();
             ptr.button(
@@ -310,7 +377,6 @@ fn handle_pointer_button(
             ptr.frame(state);
         }
 
-        // Insert: focus/raise the clicked window but do not forward the click.
         MouseMode::Insert => {
             if btn_state == wl_pointer::ButtonState::Pressed {
                 let pos = state.pointer.current_location();
@@ -346,8 +412,6 @@ fn handle_pointer_axis(
     state: &mut KittyCompositor,
     event: <LibinputInputBackend as smithay::backend::input::InputBackend>::PointerAxisEvent,
 ) {
-    // Scroll forwarded in Normal mode; suppressed in Insert (compositor owns
-    // the mouse — there is no app scroll target).
     if state.mouse_mode == MouseMode::Insert {
         return;
     }

@@ -1,17 +1,22 @@
 // main.rs — entry point, event loop, exec, config reload
 
 mod backend;
+mod box_drawing;
 mod config;
 mod embedded_ipc;
 mod embedded_window;
+mod font;
 mod handlers;
 mod input;
+mod pixelui;
 mod render;
 mod shader_config;
 mod shader_ipc;
 mod shader_pass;
+mod shaper;
 mod shared_frame_shm;
 mod state;
+mod twm_drop_in;
 mod util;
 
 // expose reload_config to input.rs via crate::main_loop
@@ -82,6 +87,7 @@ pub fn reload_config(state: &mut KittyCompositor) {
     state.config.background_color = new.background_color;
     state.config.target_hz = new.target_hz;
     state.config.vsync = new.vsync;
+    state.config.font = new.font.clone();
     state.config.keybinds = new.keybinds;
     state.config.window_rules = new.window_rules;
     state.config.exec = new.exec.clone();
@@ -154,6 +160,9 @@ fn spawn_exec_entry(entry: &ExecEntry, wayland_socket: &str) {
 // ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
+    use std::io::Write;
+    let _ = std::io::stderr().write_all(b"=== trixie binary started ===\n");
+    let _ = std::io::stderr().flush();
     // ── Nvidia environment (must precede EGL/GBM init) ────────────────────────
     // SAFETY: called before any threads are spawned.
     unsafe {
@@ -163,7 +172,10 @@ fn main() {
         std::env::set_var("__GL_SYNC_TO_VBLANK", "0");
     }
 
-    tracing_subscriber::fmt().compact().init();
+    tracing_subscriber::fmt()
+        .with_writer(|| -> Box<dyn std::io::Write> { Box::new(std::io::stderr()) })
+        .with_max_level(tracing::Level::DEBUG)
+        .init();
 
     let config = Config::load();
 
@@ -316,6 +328,7 @@ fn main() {
         start_time,
         embedded: EmbeddedManager::default(),
         embed_ipc: EmbedIpcServer::bind(),
+        twm: Some(twm_drop_in::TwmState::new(80, 24)),
         unclaimed_toplevels: HashMap::new(),
     };
 
@@ -433,11 +446,11 @@ fn main() {
     let running = state.running.clone();
     let (bin, args) = state.config.terminal_cmd();
     println!("Launching {bin} on WAYLAND_DISPLAY={socket_name}");
-    Command::new(&bin)
-        .args(&args)
-        .env("WAYLAND_DISPLAY", &socket_name)
-        .spawn()
-        .unwrap_or_else(|e| panic!("Failed to spawn {bin}: {e}"));
+    // Command::new(&bin)
+    //     .args(&args)
+    //     .env("WAYLAND_DISPLAY", &socket_name)
+    //     .spawn()
+    //     .unwrap_or_else(|e| panic!("Failed to spawn {bin}: {e}"));
 
     run_exec_once(&mut state);
     run_exec(&state);

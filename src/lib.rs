@@ -1,8 +1,13 @@
+mod box_drawing;
 pub mod config;
 mod embedded_ipc;
 mod embedded_window;
+mod font;
+pub mod pixelui;
 pub mod shader_config;
 pub mod shader_ipc;
 pub mod shader_pass;
+pub mod shaper;
 pub mod shared_frame_shm;
+mod twm_drop_in;
 pub mod util;

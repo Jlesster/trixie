@@ -11,6 +11,7 @@ use crate::config::Config;
 use crate::embedded_ipc::{EmbedCommand, EmbedIpcServer};
 use crate::embedded_window::{EmbeddedManager, EmbeddedPlacement, EmbeddedRenderElement};
 use crate::shader_pass::ShaderPass;
+use crate::twm_drop_in::TwmState;
 
 use smithay::{
     backend::renderer::element::AsRenderElements,
@@ -57,6 +58,9 @@ use smithay::{
     },
 };
 
+use crate::pixelui::overlay_element::TwmChromeElement;
+use ratatui::layout::Margin;
+
 // ── type alias ────────────────────────────────────────────────────────────────
 
 pub type GbmDrmCompositor =
@@ -69,6 +73,7 @@ smithay::backend::renderer::element::render_elements! {
     Space    = WaylandSurfaceRenderElement<GlesRenderer>,
     Cursor   = SolidColorRenderElement,
     Embedded = EmbeddedRenderElement,
+    Chrome   = TwmChromeElement,
 }
 
 // ── mouse mode ────────────────────────────────────────────────────────────────
@@ -145,6 +150,7 @@ pub struct KittyCompositor {
     pub primary_selection_state: PrimarySelectionState,
     pub xdg_shell_state: XdgShellState,
     pub layer_shell_state: WlrLayerShellState,
+    pub twm: Option<TwmState>,
     pub xdg_decoration_state: XdgDecorationState,
     pub popups: PopupManager,
 
@@ -154,11 +160,8 @@ pub struct KittyCompositor {
     pub cursor_status: CursorImageStatus,
     pub mouse_mode: MouseMode,
 
-    // ── embedded windows ──────────────────────────────────────────────────────
     pub embedded: EmbeddedManager,
     pub embed_ipc: EmbedIpcServer,
-    /// Toplevels whose app_id was not yet known at new_toplevel time.
-    /// Keyed by WlSurface ObjectId; retried on each commit.
     pub unclaimed_toplevels: HashMap<ObjectId, ToplevelSurface>,
 
     pub session: LibSeatSession,
@@ -200,13 +203,102 @@ impl KittyCompositor {
         }
 
         let output = surface.output.clone();
+
+        // Use physical pixel dimensions — must match what set_viewport() received
+        // (drm_mode.size() in backend.rs). output.current_mode().size is in logical
+        // pixels and differs from physical when output scale != 1, which would desync
+        // DrawCmd pixel coordinates from the u_vp NDC projection in the shader.
+        let (output_w, output_h) = crate::pixelui::overlay_element::get_viewport();
+
         let scale = smithay::utils::Scale::from(output.current_scale().fractional_scale());
         let clear: [f32; 4] = {
             let c = self.config.background_color;
             [c[0], c[1], c[2], 1.0]
         };
 
-        // ── 1. Embedded quads ─────────────────────────────────────────────────
+        // ── 1. TWM chrome ─────────────────────────────────────────────────────
+        let chrome_el: Option<TwmChromeElement> = if let Some(twm) = &mut self.twm {
+            let (cw, ch) = crate::pixelui::overlay_element::cell_size();
+            if crate::pixelui::overlay_element::is_installed() {
+                let cols = (output_w / cw).max(1) as u16;
+                let rows = (output_h / ch).max(1) as u16;
+                tracing::info!(
+                    "twm resize: output={}x{} cell={}x{} cols={} rows={} bar_bottom_px={}",
+                    output_w,
+                    output_h,
+                    cw,
+                    ch,
+                    cols,
+                    rows,
+                    (rows as u32) * ch
+                );
+                if twm.cols != cols || twm.rows != rows {
+                    twm.resize(cols, rows);
+                }
+                let cmds = twm.build_frame_cmds(cw, ch, output_w, output_h);
+                tracing::info!(
+                    "chrome: cell={}x{} output={}x{} cols={} rows={} cmds={}",
+                    cw,
+                    ch,
+                    output_w,
+                    output_h,
+                    cols,
+                    rows,
+                    cmds.len()
+                );
+                Some(TwmChromeElement::new(cmds, output_w, output_h))
+            } else {
+                tracing::warn!("chrome: cell_size is (8,16) default — renderer not installed");
+                None
+            }
+        } else {
+            tracing::warn!("chrome: self.twm is None");
+            None
+        };
+
+        // ── 2. Sync embedded placements from TWM layout ───────────────────────
+        let embedded_rects: Vec<(String, i32, i32, i32, i32)> = if let Some(twm) = &self.twm {
+            let (cw, ch) = crate::pixelui::overlay_element::cell_size();
+            twm.all_embedded_cell_rects()
+                .into_iter()
+                .map(|(app_id, r)| {
+                    let inner = r.inner(&Margin {
+                        horizontal: 1,
+                        vertical: 1,
+                    });
+                    let px = inner.x as i32 * cw as i32;
+                    let py = inner.y as i32 * ch as i32;
+                    let pw = inner.width as i32 * cw as i32;
+                    let ph = inner.height as i32 * ch as i32;
+                    (app_id, px, py, pw, ph)
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+        for (app_id, px, py, pw, ph) in embedded_rects {
+            self.embedded.update_placement(
+                &app_id,
+                EmbeddedPlacement {
+                    x: px,
+                    y: py,
+                    w: pw,
+                    h: ph,
+                },
+            );
+        }
+
+        // Re-borrow backend mutably after the self.twm / self.embedded work.
+        let backend = match self.backends.get_mut(&node) {
+            Some(b) => b,
+            None => return,
+        };
+        let surface = match backend.surfaces.get_mut(&crtc) {
+            Some(s) => s,
+            None => return,
+        };
+
+        // ── 3. Embedded quads ─────────────────────────────────────────────────
         let embedded_elements: Vec<TrixieRenderElement> = self
             .embedded
             .render_elements()
@@ -214,9 +306,7 @@ impl KittyCompositor {
             .map(TrixieRenderElement::Embedded)
             .collect();
 
-        // ── 2. Space elements ─────────────────────────────────────────────────
-        // space_render_elements returns a single SpaceRenderElements value,
-        // not a Vec — collect via AsRenderElements on each window instead.
+        // ── 4. Space elements ─────────────────────────────────────────────────
         let space_elements: Vec<TrixieRenderElement> = self
             .space
             .elements()
@@ -232,11 +322,17 @@ impl KittyCompositor {
             .map(TrixieRenderElement::Space)
             .collect();
 
-        // ── 3. Merge ──────────────────────────────────────────────────────────
-        let mut all: Vec<TrixieRenderElement> = embedded_elements;
+        // ── 5. Assemble — chrome first (bottom), windows on top ───────────────
+        let mut all: Vec<TrixieRenderElement> = Vec::new();
+        if let Some(el) = chrome_el {
+            all.push(TrixieRenderElement::Chrome(el));
+        }
+        all.extend(embedded_elements);
         all.extend(space_elements);
 
-        // ── 4. Render frame ───────────────────────────────────────────────────
+        tracing::info!("render_surface: {} total elements", all.len(),);
+
+        // ── 6. Render frame ───────────────────────────────────────────────────
         let render_result = surface.compositor.render_frame::<_, TrixieRenderElement>(
             &mut backend.renderer,
             &all,
@@ -248,11 +344,11 @@ impl KittyCompositor {
             Ok(frame) => {
                 if !frame.is_empty {
                     match surface.compositor.queue_frame(()) {
-                        Ok(()) => {
-                            surface.pending_frame = true;
-                        }
+                        Ok(()) => surface.pending_frame = true,
                         Err(e) => tracing::warn!("queue_frame({node},{crtc:?}): {e}"),
                     }
+                } else {
+                    tracing::info!("render_surface: frame was empty (no damage)");
                 }
             }
             Err(e) => tracing::warn!("render_frame({node},{crtc:?}): {e}"),
@@ -267,6 +363,34 @@ impl KittyCompositor {
                 s.pending_frame = false;
                 if let Err(e) = s.compositor.frame_submitted() {
                     tracing::warn!("frame_submitted({node},{crtc:?}): {e}");
+                }
+            }
+        }
+    }
+
+    // ── TWM helpers ───────────────────────────────────────────────────────────
+
+    pub fn sync_twm_focus_to_wayland(&mut self) {
+        use crate::twm_drop_in::PaneContent;
+        let focused_app_id = self
+            .twm
+            .as_ref()
+            .and_then(|t| t.focused_content())
+            .and_then(|c| match c {
+                PaneContent::Embedded { app_id } => Some(app_id.clone()),
+                _ => None,
+            });
+
+        if let Some(app_id) = focused_app_id {
+            let surface = self
+                .embedded
+                .entries
+                .get(&app_id)
+                .map(|e| e.surface.clone());
+            if let Some(s) = surface {
+                let serial = SCOUNTER.next_serial();
+                if let Some(kbd) = self.seat.get_keyboard() {
+                    kbd.set_focus(self, Some(s), serial);
                 }
             }
         }
@@ -295,6 +419,10 @@ impl KittyCompositor {
             } => {
                 self.embedded
                     .request_placement(&app_id, EmbeddedPlacement { x, y, w, h });
+
+                if let Some(twm) = &mut self.twm {
+                    twm.assign_embedded(&app_id);
+                }
 
                 let socket = self.wayland_socket.clone();
                 tracing::info!("Spawning embedded '{}' on {socket}", app_id);
@@ -336,6 +464,9 @@ impl KittyCompositor {
                     entry.toplevel.send_close();
                 } else {
                     self.embedded.remove(&app_id);
+                }
+                if let Some(twm) = &mut self.twm {
+                    twm.close_pane_by_app_id(&app_id);
                 }
             }
 

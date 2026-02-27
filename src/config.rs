@@ -2,19 +2,7 @@
 //
 // Config is loaded from ~/.config/trixie/*.conf (or $TRIXIE_CONFIG_DIR).
 // Uses Hyprland-style key = value / section { } syntax.
-//
-// Recognised files and the keys they carry (all optional):
-//
-//   general.conf   →  terminal, seat_name, background_color,
-//                     target_hz, vsync
-//                     vibrance { enabled, strength, balance }
-//   keyboard.conf  →  keyboard { layout, variant, options,
-//                                repeat_delay, repeat_rate,
-//                                modifier }
-//   keymaps.conf   →  bind = <mods>, <key>, <action>
-//   rules.conf     →  windowrule = <action>, <matcher>[, size W H][, pos X Y]
-//   autostart.conf →  exec      = <command>
-//                     exec_once = <command>
+
 use crate::shader_config::ShaderRegistry;
 use crate::util::{expand_tilde, hex4, resolve_path, shell_words, strip_comment};
 use std::path::{Path, PathBuf};
@@ -30,6 +18,7 @@ pub struct Config {
     pub vsync: VsyncMode,
     pub vibrance: VibranceConfig,
     pub keyboard: KeyboardConfig,
+    pub font: FontConfig,
     pub keybinds: Vec<Keybind>,
     pub window_rules: Vec<WindowRule>,
     pub exec: Vec<ExecEntry>,
@@ -49,6 +38,31 @@ impl Config {
             hz
         };
         std::time::Duration::from_micros(1_000_000 / hz)
+    }
+}
+
+// ── font ──────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct FontConfig {
+    pub path: String,
+    pub bold_path: Option<String>,
+    pub italic_path: Option<String>,
+    pub size: f32,
+    pub line_spacing: Option<f32>,
+    pub dpi: Option<u32>,
+}
+
+impl Default for FontConfig {
+    fn default() -> Self {
+        Self {
+            path: "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf".into(),
+            bold_path: None,
+            italic_path: None,
+            size: 14.0,
+            line_spacing: Some(1.1),
+            dpi: Some(96),
+        }
     }
 }
 
@@ -90,9 +104,6 @@ pub struct ExecEntry {
 }
 
 // ── keyboard ──────────────────────────────────────────────────────────────────
-//
-// Unified keyboard config — absorbs both the old KeyboardConfig and the
-// `modifier` field that previously lived only in twm_config::InputConfig.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Modifier {
@@ -114,7 +125,6 @@ pub struct KeyboardConfig {
     pub options: Option<String>,
     pub repeat_delay: u32,
     pub repeat_rate: u32,
-    /// Primary compositor modifier key (default: Super).
     pub modifier: Modifier,
 }
 
@@ -184,6 +194,7 @@ impl Default for Config {
             vsync: VsyncMode::On,
             vibrance: VibranceConfig::default(),
             keyboard: KeyboardConfig::default(),
+            font: FontConfig::default(),
             keybinds: vec![Keybind {
                 mods: vec!["super".into(), "shift".into()],
                 key: "print".into(),
@@ -254,12 +265,11 @@ impl Config {
         cfg.shaders = ShaderRegistry::load(&Self::config_dir());
 
         tracing::info!(
-            "Config loaded — terminal={:?} vsync={:?} target_hz={:?} vibrance={} strength={:.2}",
+            "Config loaded — terminal={:?} vsync={:?} target_hz={:?} font={:?}",
             cfg.terminal,
             cfg.vsync,
             cfg.target_hz,
-            cfg.vibrance.enabled,
-            cfg.vibrance.strength
+            cfg.font.path,
         );
         cfg
     }
@@ -306,14 +316,12 @@ fn parse_into(
             continue;
         }
 
-        // Open section
         if line.ends_with('{') {
             let name = line.trim_end_matches('{').trim().to_lowercase();
             section_stack.push(name);
             continue;
         }
 
-        // Close section
         if line == "}" {
             section_stack
                 .pop()
@@ -331,7 +339,6 @@ fn parse_into(
 
         let section = section_stack.last().map(String::as_str).unwrap_or("");
 
-        // source directive
         if key == "source" && section.is_empty() {
             let path = resolve_path(value, file);
             if !path.exists() {
@@ -360,6 +367,7 @@ fn parse_into(
             "general" => apply_general(key, value, file, lineno, cfg),
             "vibrance" => apply_vibrance(key, value, file, lineno, &mut cfg.vibrance),
             "keyboard" => apply_keyboard(key, value, file, lineno, &mut cfg.keyboard),
+            "font" => apply_font(key, value, file, lineno, &mut cfg.font),
             other => tracing::warn!("{}:{} — unknown section `{other}`", file.display(), lineno),
         }
     }
@@ -402,7 +410,6 @@ fn apply_toplevel(
         },
         "exec" => cfg.exec.push(parse_exec(value)),
         "exec_once" => cfg.exec_once.push(parse_exec(value)),
-        // Allow general/vibrance/keyboard keys at top level too (flat files).
         "terminal" => cfg.terminal = value.to_string(),
         "seat_name" => cfg.seat_name = value.to_string(),
         "background_color" => {
@@ -499,35 +506,44 @@ fn apply_keyboard(key: &str, value: &str, file: &Path, lineno: usize, k: &mut Ke
     }
 }
 
+fn apply_font(key: &str, value: &str, file: &Path, lineno: usize, f: &mut FontConfig) {
+    match key {
+        "path" => f.path = expand_tilde(value),
+        "bold_path" => f.bold_path = Some(expand_tilde(value)),
+        "italic_path" => f.italic_path = Some(expand_tilde(value)),
+        "size" => match value.trim().parse::<f32>() {
+            Ok(n) => f.size = n,
+            Err(_) => tracing::warn!("{}:{} — bad font size `{value}`", file.display(), lineno),
+        },
+        "line_spacing" => match value.trim().parse::<f32>() {
+            Ok(n) => f.line_spacing = Some(n),
+            Err(_) => tracing::warn!("{}:{} — bad line_spacing `{value}`", file.display(), lineno),
+        },
+        "dpi" => match value.trim().parse::<u32>() {
+            Ok(n) => f.dpi = Some(n),
+            Err(_) => tracing::warn!("{}:{} — bad dpi `{value}`", file.display(), lineno),
+        },
+        _ => tracing::warn!("{}:{} — unknown font.{key}", file.display(), lineno),
+    }
+}
+
 // ── bind parsing ──────────────────────────────────────────────────────────────
-//
-// Format:  bind = <mods…>, <key>, <action> [args…]
-//
-// Examples:
-//   bind = super shift, print,   quit
-//   bind = super,       return,  spawn kitty
-//   bind = super,       q,       close_window
-//   bind = super,       r,       reload_config
 
 fn parse_bind(value: &str) -> Option<Keybind> {
     let parts: Vec<&str> = value.splitn(3, ',').map(str::trim).collect();
     if parts.len() < 3 {
         return None;
     }
-
     let mods: Vec<String> = parts[0]
         .split_whitespace()
         .map(|m| m.to_lowercase())
         .filter(|m| !m.is_empty())
         .collect();
-
     let key = parts[1].trim().to_lowercase();
     if key.is_empty() {
         return None;
     }
-
     let action = parse_key_action(parts[2].trim())?;
-
     Some(Keybind { mods, key, action })
 }
 
@@ -551,7 +567,6 @@ fn parse_key_action(s: &str) -> Option<KeyAction> {
             args: words,
         });
     }
-
     match s {
         "quit" => Some(KeyAction::Quit),
         "close_window" | "close" => Some(KeyAction::CloseWindow),
@@ -567,7 +582,6 @@ fn parse_windowrule(value: &str) -> Option<WindowRule> {
     if parts.len() < 2 {
         return None;
     }
-
     let action = parts[0].to_lowercase();
     let floating = action == "float" || action == "floating";
     let matcher = parts[1].to_string();
@@ -579,7 +593,6 @@ fn parse_windowrule(value: &str) -> Option<WindowRule> {
 
     let mut size: Option<[i32; 2]> = None;
     let mut position: Option<[i32; 2]> = None;
-
     for extra in parts.iter().skip(2) {
         if let Some(s) = extra.strip_prefix("size ") {
             let ns: Vec<i32> = s
@@ -599,7 +612,6 @@ fn parse_windowrule(value: &str) -> Option<WindowRule> {
             }
         }
     }
-
     Some(WindowRule {
         app_id,
         title: None,
@@ -654,7 +666,6 @@ fn parse_color_f32(s: &str) -> Option<[f32; 4]> {
     if stripped.len() >= 6 {
         return Some(hex4(s));
     }
-    // Try space-separated floats: R G B [A]
     let nums: Vec<f32> = s
         .split_whitespace()
         .filter_map(|n| n.parse().ok())
@@ -675,13 +686,11 @@ pub fn mods_match(mods: &ModifiersState, required: &[String], keyboard: &Keyboar
     let wants_shift = required.iter().any(|m| m == "shift");
     let wants_ctrl = required.iter().any(|m| m == "ctrl");
     let wants_alt = required.iter().any(|m| m == "alt");
-
     let super_held = match keyboard.modifier {
         Modifier::Super => mods.logo,
         Modifier::Alt => mods.alt,
         Modifier::Ctrl => mods.ctrl,
     };
-
     mods.shift == wants_shift
         && mods.ctrl == wants_ctrl
         && mods.alt == wants_alt
@@ -692,7 +701,7 @@ pub fn normalise_key_name(name: &str) -> String {
     name.to_lowercase()
 }
 
-// ── spawn helper (pub for use from input.rs) ──────────────────────────────────
+// ── spawn helper ──────────────────────────────────────────────────────────────
 
 pub fn spawn_process(cmd: &str, args: &[String], wayland_socket: &str) {
     let bin = expand_tilde(cmd);
@@ -754,7 +763,6 @@ mod tests {
 
     #[test]
     fn bind_empty_key_rejected() {
-        // A trailing comma or empty key field must not produce a keybind.
         let cfg = parse("bind = super, , quit");
         assert_eq!(cfg.keybinds.len(), 0);
     }
@@ -806,5 +814,14 @@ mod tests {
     fn hex_color_not_stripped_as_comment() {
         let cfg = parse("background_color = #1E1E2E");
         assert!((cfg.background_color[0] - 0x1E as f32 / 255.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn font_section() {
+        let cfg =
+            parse("font {\n  path = /usr/share/fonts/TTF/Hack.ttf\n  size = 16.0\n  dpi = 144\n}");
+        assert_eq!(cfg.font.path, "/usr/share/fonts/TTF/Hack.ttf");
+        assert!((cfg.font.size - 16.0).abs() < 1e-6);
+        assert_eq!(cfg.font.dpi, Some(144));
     }
 }
